@@ -1,0 +1,112 @@
+name: 构建 macOS 安装包
+
+# 目的：没有 Mac 也能拿到 .app / .dmg。
+# 用法：
+#   1) 把本仓库推到 GitHub
+#   2) 到 Actions 页面选「构建 macOS 安装包」→ Run workflow
+#   3) 跑完在该次运行页面底部下载 artifact（arm64 / x86_64 各一份 .dmg 与 .zip）
+# 或者打一个 v* 标签，会自动创建 Release 并把安装包附上去。
+#
+# 注意：macOS 的二进制必须在 macOS 上构建，Windows / Linux 都产不出来
+#       （PyInstaller 不是交叉编译器；electron-builder 也报
+#        “Build for macOS is supported only on macOS”）。
+#       所以这个工作流用的是 GitHub 提供的 macOS runner。
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write          # 打 tag 时创建 Release 需要
+
+jobs:
+  macos:
+    name: macOS ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 标签可用性核对于 2026-09-17：
+          #   macos-13 已于 2025-12-04 完全退役，用了会立刻失败
+          #   macos-14 已进入仅安全维护期，2026-11-02 EOL → 不要再用
+          #   macos-15        = Apple Silicon (arm64)
+          #   macos-15-intel  = Intel (x86_64)
+          - runner: macos-15
+            label: arm64
+          - runner: macos-15-intel
+            label: x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: 环境自检
+        run: |
+          echo "runner OS : $(sw_vers -productVersion)"
+          echo "CPU arch  : $(uname -m)"
+          python -c "import platform,sys;print('python   :',sys.version.split()[0],platform.machine())"
+          command -v iconutil >/dev/null && echo "iconutil  : OK" || echo "iconutil  : 缺失（图标不会转换）"
+          command -v hdiutil  >/dev/null && echo "hdiutil   : OK" || echo "hdiutil   : 缺失（不会生成 dmg）"
+
+      - name: 打包 .app 与 .dmg
+        env:
+          SKIP_DMG: "0"
+        run: bash mac/build_mac.sh
+
+      - name: 校验产物
+        run: |
+          set -e
+          ls -lh dist-mac/
+          test -d "dist-mac/科研数据归档助手.app" || { echo "!! 缺少 .app"; exit 1; }
+          test -f "dist-mac/科研数据归档助手.dmg" || { echo "!! 缺少 .dmg"; exit 1; }
+          echo "== 可执行文件架构："
+          file "dist-mac/科研数据归档助手.app/Contents/MacOS/科研数据归档助手"
+
+      - name: 打包 .app 为 zip
+        run: |
+          cd dist-mac
+          ditto -c -k --sequesterRsrc --keepParent \
+                "科研数据归档助手.app" \
+                "科研数据归档助手-${{ matrix.label }}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rdarchiver-macos-${{ matrix.label }}
+          path: |
+            dist-mac/*.zip
+            dist-mac/*.dmg
+          if-no-files-found: error
+          retention-days: 90
+
+  release:
+    name: 发布到 Releases
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: macos
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: 列出待发布文件
+        run: find artifacts -type f | sort
+
+      - name: 创建 Release 并上传安装包
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          mapfile -t FILES < <(find artifacts -type f \( -name '*.dmg' -o -name '*.zip' \) | sort)
+          printf '待上传：\n%s\n' "${FILES[@]}"
+          gh release create "$GITHUB_REF_NAME" \
+             --title "$GITHUB_REF_NAME" \
+             --generate-notes \
+             "${FILES[@]}"

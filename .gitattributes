@@ -1,0 +1,37 @@
+# ---------------------------------------------------------------------------
+# 换行符策略
+#
+# 本仓库在 Windows 上编辑、在 macOS / Linux 上构建执行。
+# Windows 的 git 默认 core.autocrlf=true，会把文本文件写成 CRLF ——
+# 那样 shell 脚本传到 mac 上会报 “\r: command not found”，CI 直接失败。
+# 因此这里强制：shell 脚本永远 LF，其余文本按仓库统一 LF。
+# ---------------------------------------------------------------------------
+
+# 仓库里一律用 LF 存储
+* text=auto eol=lf
+
+# shell 脚本必须 LF（少一个都不行）
+*.sh        text eol=lf
+*.command   text eol=lf
+*.bash      text eol=lf
+
+# CI 配置
+*.yml       text eol=lf
+*.yaml      text eol=lf
+
+# Python / 文本
+*.py        text eol=lf
+*.md        text eol=lf
+*.txt       text eol=lf
+*.json      text eol=lf
+*.csv       text eol=lf
+
+# 二进制：不要做任何换行转换
+*.ico       binary
+*.icns      binary
+*.png       binary
+*.jpg       binary
+*.xlsx      binary
+*.exe       binary
+*.dmg       binary
+*.zip       binary

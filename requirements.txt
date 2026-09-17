@@ -1,0 +1,13 @@
+# 科研数据归档助手 —— 构建依赖
+# 两个平台（Windows / macOS）的打包脚本都从这里装依赖，避免版本漂移。
+
+PySide6>=6.6
+pyinstaller>=6.0
+# 「数据台账」页导出官方表结构的 xlsx 需要它（ledger.export_xlsx 里动态导入）。
+# 注意：漏装不会导致程序崩溃——界面会提示“缺少组件”，但 Excel 台账导出会不可用。
+openpyxl>=3.1
+
+# ---------------------------------------------------------------- 常用命令
+# Windows 打包：   python build.py
+# macOS 打包：     bash mac/build_mac.sh
+# 开发期直接运行：  python app.py

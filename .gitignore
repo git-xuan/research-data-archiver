@@ -1,0 +1,41 @@
+# ---------------------------------------------------------------------------
+# 构建产物（不要提交，否则仓库会多出 ~280 MB）
+# ---------------------------------------------------------------------------
+build/
+build_dbg/
+dist/
+dist_dbg/
+dist-mac/
+out/
+wbuild/
+wbuild-mac/
+_icon_tmp/
+
+# 虚拟环境
+.venv/
+.venv-mac/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# macOS / Windows
+.DS_Store
+Thumbs.db
+desktop.ini
+~$*
+
+# 编辑器
+.vscode/
+.idea/
+
+# ---------------------------------------------------------------------------
+# 以下内容要保留（会被打包或用于构建，不要忽略）：
+#   app.py core.py data.py ledger.py skin.py     ← 源码
+#   app.ico app.png icon.iconset/                ← 图标（mac 需要 iconset 生成 icns）
+#   mac/ .github/ requirements.txt               ← 构建脚本与 CI
+#   screenshots/                                 ← 界面截图（文档用）
+#   示例-科研数据元信息台账.xlsx                    ← 台账导出示例
+# ---------------------------------------------------------------------------
