@@ -252,26 +252,89 @@ def _write_readme(root: str, manifest: dict) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# 系统垃圾文件过滤
+#
+# 这些是操作系统或 Office 自动生成的，不是科研数据本体，不该出现在
+# 「待归档候选」和「归档自查」列表里（macOS 上 .DS_Store 尤其泛滥）。
+# --------------------------------------------------------------------------- #
+JUNK_NAMES = {
+    # macOS
+    ".DS_Store", ".localized", "Icon\r", ".apdisk",
+    # Windows
+    "Thumbs.db", "ehthumbs.db", "desktop.ini",
+    # 通用
+    "Desktop.ini",
+}
+JUNK_PREFIXES = (
+    "._",       # macOS AppleDouble 资源分叉
+    "~$",       # Office（Word/Excel/PPT）打开文件时生成的锁文件
+    ".~lock.",  # LibreOffice 锁文件
+)
+JUNK_DIRS = {
+    ".Spotlight-V100", ".Trashes", ".fseventsd", ".TemporaryItems",
+    ".DocumentRevisions-V100", ".PKInstallSandboxManager",
+    "__MACOSX", "$RECYCLE.BIN", "System Volume Information",
+}
+
+
+def is_junk(name: str) -> bool:
+    """是否属于应当忽略的系统/临时文件。"""
+    if not name:
+        return False
+    if name in JUNK_NAMES:
+        return True
+    for pre in JUNK_PREFIXES:
+        if name.startswith(pre):
+            return True
+    if name.endswith(".tmp") and name.startswith("~"):
+        return True
+    return False
+
+
+def junk_desc() -> str:
+    return ".DS_Store、~$ 临时文件等"
+
+
+# --------------------------------------------------------------------------- #
 # 来源扫描
 # --------------------------------------------------------------------------- #
-def scan_sources(paths: List[str], recurse: bool = True) -> List[str]:
-    """把用户选择的文件夹/文件展开为文件绝对路径列表。"""
+def scan_sources(paths: List[str], recurse: bool = True,
+                 stats: Optional[dict] = None) -> List[str]:
+    """
+    把用户选择的文件夹/文件展开为文件绝对路径列表。
+
+    会自动跳过系统/临时文件（.DS_Store、~~$xxx.xlsx 等）；传入 stats 时会写入
+    {"junk_skipped": n}，便于界面提示"已忽略多少个系统文件"。
+    """
     out: List[str] = []
+    skipped = 0
     for p in paths:
         if os.path.isfile(p):
+            if is_junk(os.path.basename(p)):
+                skipped += 1
+                continue
             out.append(os.path.abspath(p))
         elif os.path.isdir(p):
             if recurse:
-                for dirpath, _dirnames, filenames in os.walk(p):
-                    if os.path.basename(dirpath) == INDEX_DIR:
-                        continue
+                for dirpath, dirnames, filenames in os.walk(p):
+                    dirnames[:] = [d for d in dirnames
+                                   if d not in JUNK_DIRS and d != INDEX_DIR]
                     for fn in filenames:
+                        if is_junk(fn):
+                            skipped += 1
+                            continue
                         out.append(os.path.abspath(os.path.join(dirpath, fn)))
             else:
                 for fn in os.listdir(p):
                     fp = os.path.join(p, fn)
-                    if os.path.isfile(fp):
-                        out.append(os.path.abspath(fp))
+                    if not os.path.isfile(fp):
+                        continue
+                    if is_junk(fn):
+                        skipped += 1
+                        continue
+                    out.append(os.path.abspath(fp))
+    if stats is not None:
+        stats["junk_skipped"] = skipped
     # 去重并保序
     seen, uniq = set(), []
     for p in out:
@@ -475,7 +538,8 @@ def list_scope_folders(root: str, depth: int = 2) -> List[Tuple[str, str, int]]:
         return out
     try:
         first = sorted(d for d in os.listdir(root)
-                       if os.path.isdir(os.path.join(root, d)) and d != INDEX_DIR)
+                       if os.path.isdir(os.path.join(root, d))
+                       and d != INDEX_DIR and d not in JUNK_DIRS)
     except OSError:
         return out
     for a in first:
@@ -493,22 +557,33 @@ def list_scope_folders(root: str, depth: int = 2) -> List[Tuple[str, str, int]]:
     return out
 
 
-def scan_archive(root: str, scope: Optional[str] = None) -> List[dict]:
+def scan_archive(root: str, scope: Optional[str] = None,
+                 stats: Optional[dict] = None) -> List[dict]:
     """
     扫描归档目录，或其中的任意一级子文件夹（scope 为空表示整个归档根目录）。
 
     返回记录的字段：path / rel / name / size / mtime，
     以及 l1、l2（相对归档根目录的前两级）和 group（抽样分组名）。
+
+    会跳过系统/临时文件（.DS_Store、~$ 锁文件等）；传入 stats 时写入
+    {"junk_skipped": n}，便于界面提示"已忽略多少个系统文件"。
     """
     root = os.path.abspath(root)
     base = os.path.abspath(scope) if scope else root
     records: List[dict] = []
+    skipped = 0
     if not os.path.isdir(base):
+        if stats is not None:
+            stats["junk_skipped"] = 0
         return records
     whole = (base == root)
     for dirpath, dirnames, filenames in os.walk(base):
-        dirnames[:] = [d for d in dirnames if d != INDEX_DIR]
+        dirnames[:] = [d for d in dirnames
+                       if d != INDEX_DIR and d not in JUNK_DIRS]
         for fn in filenames:
+            if is_junk(fn):
+                skipped += 1
+                continue
             fp = os.path.join(dirpath, fn)
             try:
                 st = os.stat(fp)
@@ -538,6 +613,8 @@ def scan_archive(root: str, scope: Optional[str] = None) -> List[dict]:
                 "mtime": _dt.datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M"),
             })
     records.sort(key=lambda r: (r["group"], r["name"].lower()))
+    if stats is not None:
+        stats["junk_skipped"] = skipped
     return records
 
 

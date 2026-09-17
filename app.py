@@ -125,14 +125,13 @@ class _FlexCols:
     """
     列宽全部可手动拖动调整。
 
-    做法：真实列之后额外留一个空白「占位列」，由它自动吸收/让出剩余宽度，
-    这样既不会有右侧大片留白，真实列也不会被锁死成固定宽度。
+    只把表头设成 Interactive 就够了 —— 不要额外加"占位列"。
+    Qt 的占位列会在表头多出一个空白格子，看起来像多出一栏，
+    用户会以为那是没用的空列（实测反馈）。
+    列比视口窄时右侧余白由视图背景填充，行底色/选中高亮本来就会铺满整行，不影响观感。
     """
 
     def _init_flex(self, real_cols: int, min_w: int = 34):
-        self._flex_col = real_cols
-        self._flex_min = min_w
-        self._flex_busy = False
         # QTableWidget 用 horizontalHeader()，QTreeWidget 用 header()
         hh = (self.horizontalHeader() if hasattr(self, "horizontalHeader")
               else self.header())
@@ -140,27 +139,7 @@ class _FlexCols:
         hh.setStretchLastSection(False)
         hh.setMinimumSectionSize(min_w)
         hh.setSectionsClickable(True)
-        hh.sectionResized.connect(self._fill_flex)
-        self.verticalScrollBar().rangeChanged.connect(self._fill_flex)
-
-    def _fill_flex(self, *_):
-        if self._flex_busy or self._flex_col >= self.columnCount():
-            return
-        total = sum(self.columnWidth(i) for i in range(self.columnCount())
-                    if i != self._flex_col)
-        free = max(self._flex_min, self.viewport().width() - total)
-        if free != self.columnWidth(self._flex_col):
-            self._flex_busy = True
-            self.setColumnWidth(self._flex_col, free)
-            self._flex_busy = False
-
-    def resizeEvent(self, e):
-        super().resizeEvent(e)
-        self._fill_flex()
-
-    def showEvent(self, e):
-        super().showEvent(e)
-        self._fill_flex()
+        hh.setToolTip("拖动表头列与列之间的分隔线即可调整列宽")
 
 
 class CatTree(_FlexCols, QTreeWidget):
@@ -168,13 +147,7 @@ class CatTree(_FlexCols, QTreeWidget):
 
     def __init__(self, real_cols: int = 3):
         QTreeWidget.__init__(self)
-        self.setColumnCount(real_cols + 1)
-        item = self.headerItem()
-        if item is None:
-            item = QTreeWidgetItem([""] * (real_cols + 1))
-            self.setHeaderItem(item)
-        item.setText(real_cols, "")
-        item.setToolTip(real_cols, "拖动列与列之间的分隔线即可调整列宽")
+        self.setColumnCount(real_cols)
         self._init_flex(real_cols)
 
     def drawBranches(self, painter: QPainter, rect, index):
@@ -689,9 +662,15 @@ class ArchivePage(QWidget):
 
     def add_paths(self, paths):
         """把文件/文件夹展开为候选列表；候选项默认不勾选，由用户在列表里挑选。"""
-        added = core.scan_sources(list(paths))
+        stats = {}
+        added = core.scan_sources(list(paths), stats=stats)
+        junk = stats.get("junk_skipped", 0)
         if not added:
-            QMessageBox.information(self, "提示", "所选内容中没有可归档的文件。")
+            msg = "所选内容中没有可归档的文件。"
+            if junk:
+                msg += (f"\n\n（其中 {junk} 个系统/临时文件已被自动忽略："
+                        f"{core.junk_desc()}）")
+            QMessageBox.information(self, "提示", msg)
             return
         have = set(self.files)
         new = [p for p in added if p not in have]
@@ -701,6 +680,8 @@ class ArchivePage(QWidget):
         tip = f"共 {len(self.files)} 个候选文件"
         if dup:
             tip += f"（重复忽略 {dup} 个）"
+        if junk:
+            tip += f"（系统文件忽略 {junk} 个）"
         tip += " · 请在列表中勾选要归档的文件"
         self.lb_sel.setText(tip)
         if len(self.files) == 1 and not self.lb_target.text():
@@ -1085,14 +1066,10 @@ class ArchivePage(QWidget):
 
 
 class FlexTable(_FlexCols, QTableWidget):
-    """列宽可手动调整的表格（构造参数仍传真实列数）。"""
+    """列宽可手动调整的表格。"""
 
     def __init__(self, rows: int, cols: int):
-        QTableWidget.__init__(self, rows, cols + 1)
-        # 占位列的表头必须显式置空：Qt 对未设置文本的列会回退显示"列号+1"
-        spacer = QTableWidgetItem("")
-        spacer.setToolTip("拖动列与列之间的分隔线即可调整列宽")
-        self.setHorizontalHeaderItem(cols, spacer)
+        QTableWidget.__init__(self, rows, cols)
         self._init_flex(cols)
 
 
@@ -1167,6 +1144,7 @@ class CheckPage(QWidget):
         self.shown = []
         self.scope = ""            # 当前检查范围绝对路径（空 = 整个归档根目录）
         self._scan_key = None      # 已扫描的 (根目录, 范围)，参数变化时不用重扫
+        self._junk = 0             # 上次扫描被忽略的系统文件数
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -1283,7 +1261,12 @@ class CheckPage(QWidget):
         self.chip_total = Chip("范围内文件：0", PRIMARY)
         self.chip_sub = Chip("涉及子文件夹：0 个", skin.TEAL)
         self.chip_n = Chip("本次展示：0", skin.WARN)
-        for c in (self.chip_total, self.chip_sub, self.chip_n):
+        self.chip_junk = Chip("", TEXT_MUTED)
+        self.chip_junk.setToolTip(
+            "扫描时自动忽略了这些系统/临时文件：\n"
+            ".DS_Store、._*（macOS）、Thumbs.db、desktop.ini（Windows）、~$*（Office 锁文件）")
+        self.chip_junk.setVisible(False)
+        for c in (self.chip_total, self.chip_sub, self.chip_n, self.chip_junk):
             self.chips.addWidget(c)
         self.chips.addStretch(1)
         root.addWidget(c1)
@@ -1342,16 +1325,19 @@ class CheckPage(QWidget):
         self.actions.row.addWidget(b_exp)
 
     # ------------------------------------------------------------------ 范围
-    def _set_chips(self, total, nsub, n2):
+    def _set_chips(self, total, nsub, n2, njunk=0):
         self.chip_total.set_text(f"范围内文件：{total}")
         self.chip_sub.set_text(f"涉及子文件夹：{nsub} 个")
         self.chip_n.set_text(f"本次展示：{n2}")
+        self.chip_junk.set_text(f"已忽略系统文件：{njunk} 个")
+        self.chip_junk.setVisible(njunk > 0)
 
     def set_root(self, path):
         self.ed_root.setText(os.path.normpath(path) if path else "")
         self.records = []
         self.shown = []
         self._scan_key = None
+        self._junk = 0
         self._load_rule()
         self.reload_scopes()
         self.do_sample(silent=True)
@@ -1514,7 +1500,9 @@ class CheckPage(QWidget):
         scope = self.scope or root
         key = (root, scope)
         if force or key != getattr(self, "_scan_key", None):
-            self.records = core.scan_archive(root, scope)
+            stats = {}
+            self.records = core.scan_archive(root, scope, stats)
+            self._junk = stats.get("junk_skipped", 0)
             self._scan_key = key
         mode = "all" if self.rb_all.isChecked() else "ratio"
         ratio, mn, mx = self.sample_params()
@@ -1522,7 +1510,8 @@ class CheckPage(QWidget):
                                          random.Random())
         self.fill_table()
         self._set_chips(len(self.records),
-                        len({r["group"] for r in self.records}), len(self.shown))
+                        len({r["group"] for r in self.records}), len(self.shown),
+                        getattr(self, "_junk", 0))
         self._update_rule_label()
         if not self.records and not silent:
             QMessageBox.information(
@@ -1978,6 +1967,10 @@ HELP_TEXT = """
 
 <p><b>几点说明</b></p>
 <ul style="color:#5A6B84;margin:4px 0 0 0;">
+<li><b>系统文件会自动忽略</b>：扫描（归档候选与归档自查）时会跳过
+    <code>.DS_Store</code>、<code>._*</code>、<code>Thumbs.db</code>、<code>desktop.ini</code>、
+    <code>~$xxx.xlsx</code> 这类操作系统和 Office 自动生成的临时文件——它们不是科研数据本体。
+    被忽略的数量会在界面上提示，不会静默吞掉。</li>
 <li><b>主操作按钮固定在窗口底部</b>：『初始化归档目录』『开始归档』『导出问题文件清单』『导出 Excel 台账』
     始终显示在底部操作条上，内容再长也不用滚动去找。</li>
 <li><b>表格列宽都能拖动调整</b>：把鼠标移到表头两列之间的<b>分隔线</b>上，光标变成左右箭头后拖动即可，
