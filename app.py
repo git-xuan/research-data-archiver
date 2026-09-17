@@ -123,15 +123,24 @@ def _tint(hexcolor: str) -> str:
 
 class _FlexCols:
     """
-    列宽全部可手动拖动调整。
+    列宽既能在表头拖动，又始终按比例铺满可视宽度。
 
-    只把表头设成 Interactive 就够了 —— 不要额外加"占位列"。
-    Qt 的占位列会在表头多出一个空白格子，看起来像多出一栏，
-    用户会以为那是没用的空列（实测反馈）。
-    列比视口窄时右侧余白由视图背景填充，行底色/选中高亮本来就会铺满整行，不影响观感。
+    为什么不用「占位列」：Qt 会给占位列也画一个表头格子，看起来像多出一栏（实测反馈），
+    而且它只是把空白"藏"进了一个假列，并不能让真实列变宽。
+
+    这里的做法是记录每列的**权重**：
+      * 视口尺寸变化 → 按权重等比重新分配，总宽恒等于视口宽；
+      * 用户拖动某一列 → 该列直接取用户给的宽度，其余列按原比例吸收差额，
+        所以总宽依旧等于视口宽（既没有右侧留白，也不会冒出横向滚动条）。
+    初始权重取各页在设计时设定的列宽，因此各列的相对宽窄关系保持不变。
     """
 
-    def _init_flex(self, real_cols: int, min_w: int = 34):
+    def _init_flex(self, real_cols: int, min_w: int = 40):
+        self._flex_n = real_cols
+        self._flex_min = min_w
+        self._flex_w = None            # 各列权重；首次显示时用设计列宽初始化
+        self._flex_busy = False
+        self._flex_ready = False       # 首次显示前的 setColumnWidth 是初始化，不算用户拖动
         # QTableWidget 用 horizontalHeader()，QTreeWidget 用 header()
         hh = (self.horizontalHeader() if hasattr(self, "horizontalHeader")
               else self.header())
@@ -139,7 +148,80 @@ class _FlexCols:
         hh.setStretchLastSection(False)
         hh.setMinimumSectionSize(min_w)
         hh.setSectionsClickable(True)
-        hh.setToolTip("拖动表头列与列之间的分隔线即可调整列宽")
+        hh.setToolTip("拖动表头列与列之间的分隔线即可调整列宽；表格始终铺满窗口宽度")
+        hh.sectionResized.connect(self._on_flex_resized)
+        try:
+            self.verticalScrollBar().rangeChanged.connect(lambda *_: self._flex_fill())
+        except AttributeError:
+            pass
+
+    # ------------------------------------------------------------------ 内部
+    def _flex_widths(self, vp: int) -> List[int]:
+        """按权重把 vp 像素分给各列，总和尽量正好等于 vp，并尊重最小列宽。"""
+        n = self._flex_n
+        w = self._flex_w or [1.0] * n
+        total = sum(w) or 1.0
+        out = [max(self._flex_min, int(round(vp * x / total))) for x in w]
+        diff = vp - sum(out)
+        if diff:
+            # 取整误差补到最宽的那一列，避免出现 1px 的缝隙
+            i = max(range(n), key=lambda k: out[k])
+            out[i] = max(self._flex_min, out[i] + diff)
+        return out
+
+    def _flex_fill(self):
+        if self._flex_busy or self._flex_n <= 0:
+            return
+        vp = self.viewport().width()
+        if vp <= 20:
+            return
+        if self._flex_w is None:
+            self._flex_w = [max(1.0, float(self.columnWidth(i)))
+                            for i in range(self._flex_n)]
+        widths = self._flex_widths(vp)
+        if all(self.columnWidth(i) == widths[i] for i in range(self._flex_n)):
+            return
+        self._flex_busy = True
+        for i, wd in enumerate(widths):
+            self.setColumnWidth(i, wd)
+        self._flex_busy = False
+
+    def _on_flex_resized(self, index, _old, new):
+        if self._flex_busy or not self._flex_ready or index >= self._flex_n:
+            return
+        vp = self.viewport().width()
+        if vp <= 20:
+            return
+        if self._flex_w is None:
+            self._flex_w = [max(1.0, float(self.columnWidth(i)))
+                            for i in range(self._flex_n)]
+        others = [i for i in range(self._flex_n) if i != index]
+        if not others:
+            return
+        cur = [max(1.0, float(self.columnWidth(i))) for i in range(self._flex_n)]
+        others_sum = sum(cur[i] for i in others)
+        # 拖动列拿到用户要的宽度，剩下的宽度由其它列按原比例分摊
+        rest = max(float(self._flex_min) * len(others), vp - float(new))
+        k = rest / others_sum if others_sum > 0 else 1.0
+        w = [0.0] * self._flex_n
+        w[index] = max(float(self._flex_min), float(new))
+        for i in others:
+            w[i] = max(1.0, cur[i] * k)
+        self._flex_w = w
+        self._flex_fill()
+
+    # ------------------------------------------------------------------ 事件
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._flex_fill()
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        if not self._flex_ready:
+            self._flex_w = [max(1.0, float(self.columnWidth(i)))
+                            for i in range(self._flex_n)]
+            self._flex_ready = True
+        self._flex_fill()
 
 
 class CatTree(_FlexCols, QTreeWidget):
@@ -1750,7 +1832,8 @@ class LedgerPage(QWidget):
         self.tb.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.tb.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.tb.setMinimumHeight(170)
-        for i, w in enumerate((170, 152, 176, 52, 84, 92, 150, 84, 260, 240)):
+        # 设计列宽只决定各列的相对比例（表格始终铺满窗口，会按比例缩放）
+        for i, w in enumerate((160, 150, 168, 58, 86, 92, 140, 84, 230, 200)):
             self.tb.setColumnWidth(i, w)
         c2.body.addWidget(self.tb, 1)
         self.lb_tip = QLabel("提示：上表是台账的汇总视图；完整 30 列数据在 "
