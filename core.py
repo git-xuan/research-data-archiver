@@ -121,11 +121,40 @@ def is_initialized(root: str) -> bool:
     return os.path.isfile(os.path.join(root, INDEX_DIR, MANIFEST))
 
 
+def norm_dirs(dirs) -> List[str]:
+    """
+    规整一批相对目录：去重、保持先后顺序、并自动补齐所有上级目录。
+
+    用于「只创建用户勾选的那部分分类」——勾了三级目录，二级/一级必须一起建出来。
+    """
+    out: List[str] = []
+    seen = set()
+    for rel in dirs:
+        rel = rel.replace("/", os.sep).strip(os.sep)
+        if not rel:
+            continue
+        parts = rel.split(os.sep)
+        # 逐级补齐父目录
+        for k in range(1, len(parts) + 1):
+            sub = os.path.join(*parts[:k])
+            if sub not in seen:
+                seen.add(sub)
+                out.append(sub)
+    return out
+
+
 def init_archive(root: str, levels: int = 2,
-                 progress: Optional[Callable[[int, int, str], None]] = None) -> dict:
-    """按分类树在 root 下创建目录，并写入索引、日志、说明文件。"""
+                 progress: Optional[Callable[[int, int, str], None]] = None,
+                 dirs: Optional[List[str]] = None) -> dict:
+    """
+    按分类树在 root 下创建目录，并写入索引、日志、说明文件。
+
+    dirs 为空时按 levels 创建整棵树；传入 dirs 则**只创建这些目录**
+    （用于让用户只挑一部分一/二/三级分类，父目录会自动补齐）。
+    """
     root = os.path.abspath(root)
-    dirs = plan_dirs(levels)
+    partial = dirs is not None
+    dirs = norm_dirs(dirs) if partial else plan_dirs(levels)
     os.makedirs(root, exist_ok=True)
 
     total = len(dirs)
@@ -136,13 +165,22 @@ def init_archive(root: str, levels: int = 2,
 
     os.makedirs(os.path.join(root, INDEX_DIR), exist_ok=True)
 
+    counts = dict(zip(("l1", "l2", "l3", "l4"), tree_counts()))
+    if partial:
+        counts["selected"] = {
+            "l1": sum(1 for d in dirs if os.sep not in d),
+            "l2": sum(1 for d in dirs if d.count(os.sep) == 1),
+            "l3": sum(1 for d in dirs if d.count(os.sep) == 2),
+            "total": len(dirs),
+        }
     manifest = {
         "app": APP_NAME,
         "version": APP_VERSION,
         "created_at": _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "root": root,
         "levels": levels,
-        "counts": dict(zip(("l1", "l2", "l3", "l4"), tree_counts())),
+        "partial": partial,
+        "counts": counts,
         "folders": dirs,
         "renamed": {k: safe_name(k) for k in _all_class_names() if safe_name(k) != k},
         "archived": {},
@@ -204,44 +242,77 @@ def append_log(root: str, rows: List[list]) -> None:
 
 def _write_readme(root: str, manifest: dict) -> None:
     n1, n2, n3, n4 = tree_counts()
+    folders = manifest.get("folders") or plan_dirs(2)
+    partial = bool(manifest.get("partial"))
+
+    # 用实际创建的目录拼出树（支持"只创建勾选的那部分分类"）
+    tree_map: dict = {}
+    for rel in sorted(folders):
+        node = tree_map
+        for part in rel.split(os.sep):
+            node = node.setdefault(part, {})
+
+    def dump(node: dict, depth: int = 0) -> None:
+        items = list(node.items())
+        for i, (name, sub) in enumerate(items):
+            last = (i == len(items) - 1)
+            if depth == 0:
+                lines.append(name)
+            else:
+                lines.append(("│   " * (depth - 1))
+                             + ("└── " if last else "├── ") + name)
+            dump(sub, depth + 1)
+
+    c_l1 = len(tree_map)
+    c_l2 = sum(1 for d in folders if d.count(os.sep) == 1)
+    c_l3 = sum(1 for d in folders if d.count(os.sep) == 2)
+    level_desc = "一级 + 二级"
+    if c_l3:
+        level_desc = "一级 + 二级 + 三级"
+
     lines = [
-        f"# 归档目录说明",
+        "# 归档目录说明",
         "",
         f"- 归档根目录：`{root}`",
         f"- 初始化时间：{manifest['created_at']}",
-        f"- 分类层级：一级 + 二级（共 {n1} 个一级目录、{n2} 个二级目录）",
+        f"- 分类层级：{level_desc}（已创建 {c_l1} 个一级目录、{c_l2} 个二级目录"
+        + (f"、{c_l3} 个三级目录" if c_l3 else "") + f"，合计 {len(folders)} 个）",
         f"- 参考分类树：一级 {n1} / 二级 {n2} / 三级 {n3} / 四级 {n4}",
+    ]
+    if partial:
+        lines.append("- **本目录为部分初始化**：只创建了在下图中列出的分类；"
+                     "其余分类未创建，需要时可在软件中重新初始化（只会补建缺失的目录，不会动已有数据）。")
+    lines += [
         "",
         "## 目录结构",
         "",
         "```",
     ]
-    for l1, d2 in TREE.items():
-        lines.append(safe_name(l1))
-        keys = list(d2.keys())
-        for i, l2 in enumerate(keys):
-            branch = "└──" if i == len(keys) - 1 else "├──"
-            lines.append(f"{branch} {safe_name(l2)}")
+    dump(tree_map)
     lines += [
         "```",
         "",
         "## 使用说明",
         "",
-        f"1. 使用『科研数据归档助手』的 **文件归档** 页面，把科研数据复制到对应的二级分类目录中（仅复制，不删除原始文件）。",
-        f"2. 使用 **归档自查** 页面按比例随机抽样复核，导出问题文件清单。",
+        "1. 使用『科研数据归档助手』的 **文件归档** 页面，把科研数据复制到对应的二级分类目录中（仅复制，不删除原始文件）。",
+        "2. 使用 **归档自查** 页面按比例随机抽样复核，导出问题文件清单。",
         f"3. `{INDEX_DIR}/` 为本软件的索引目录，保存归档清单与日志，请勿手工修改。",
         "",
         "## 分类含义（三级 / 四级参考）",
         "",
     ]
     for l1, d2 in TREE.items():
+        if partial and safe_name(l1) not in tree_map:
+            continue
         lines.append(f"### {l1}")
         for l2, d3 in d2.items():
-            if not d3:
-                lines.append(f"- **{l2}**")
+            if partial and safe_name(l2) not in tree_map.get(safe_name(l1), {}):
                 continue
             lines.append(f"- **{l2}**")
+            made3 = tree_map.get(safe_name(l1), {}).get(safe_name(l2), {})
             for l3, d4 in d3.items():
+                if partial and made3 and safe_name(l3) not in made3:
+                    continue                     # 部分初始化时只列已创建的三级
                 if d4:
                     lines.append(f"  - {l3}：{'、'.join(d4)}")
                 else:

@@ -12,7 +12,7 @@ import random
 import subprocess
 import sys
 
-from PySide6.QtCore import QPointF, QSize, Qt, QThread, Signal, QUrl
+from PySide6.QtCore import QPointF, QSize, Qt, QThread, QTimer, Signal, QUrl
 from PySide6.QtGui import (
     QColor, QDesktopServices, QFont, QGuiApplication, QIcon, QPainter, QPen,
 )
@@ -123,24 +123,33 @@ def _tint(hexcolor: str) -> str:
 
 class _FlexCols:
     """
-    列宽既能在表头拖动，又始终按比例铺满可视宽度。
+    列宽规则：能铺满就铺满，铺不下就滚动 —— 而不是硬压到读不清。
 
     为什么不用「占位列」：Qt 会给占位列也画一个表头格子，看起来像多出一栏（实测反馈），
     而且它只是把空白"藏"进了一个假列，并不能让真实列变宽。
 
-    这里的做法是记录每列的**权重**：
-      * 视口尺寸变化 → 按权重等比重新分配，总宽恒等于视口宽；
-      * 用户拖动某一列 → 该列直接取用户给的宽度，其余列按原比例吸收差额，
-        所以总宽依旧等于视口宽（既没有右侧留白，也不会冒出横向滚动条）。
-    初始权重取各页在设计时设定的列宽，因此各列的相对宽窄关系保持不变。
+    内部状态：
+      * `_flex_w`   各列的**绝对目标宽度**（初值取各页设定的设计列宽）；
+      * `_flex_minw` 各列"不要被挤到读不清"的下限，用于**自动让位**与**窗口缩放**时的保护，
+                     不限制用户主动拖动（用户想拖多窄都行，只受全局 40px 约束）。
+
+    行为：
+      * 目标宽度之和 < 视口 → 把剩余空间按目标宽度比例分掉 → 铺满窗口，右侧不留白；
+      * 目标宽度之和 > 视口 → 原样保留 → 出现横向滚动条，内容读得全；
+      * 拖动某列时，若表格当前还能装下，其余列按比例让位（但不低于各自下限）；
+        若已经超宽（正在滚动），则只改这一列，不去挤别人；
+      * 窗口尺寸变化时，各列按新视口等比缩放，但同样不低于各自下限。
     """
 
     def _init_flex(self, real_cols: int, min_w: int = 40):
         self._flex_n = real_cols
         self._flex_min = min_w
-        self._flex_w = None            # 各列权重；首次显示时用设计列宽初始化
+        self._flex_minw = None         # 每列下限（set_flex_minimums 设定）
+        self._flex_design = None       # 设计列宽（用于一键复位）
+        self._flex_w = None            # 各列绝对目标宽度
         self._flex_busy = False
         self._flex_ready = False       # 首次显示前的 setColumnWidth 是初始化，不算用户拖动
+        self._flex_last_vp = None
         # QTableWidget 用 horizontalHeader()，QTreeWidget 用 header()
         hh = (self.horizontalHeader() if hasattr(self, "horizontalHeader")
               else self.header())
@@ -148,28 +157,92 @@ class _FlexCols:
         hh.setStretchLastSection(False)
         hh.setMinimumSectionSize(min_w)
         hh.setSectionsClickable(True)
-        hh.setToolTip("拖动表头列与列之间的分隔线即可调整列宽；表格始终铺满窗口宽度")
+        hh.setToolTip("拖动表头列与列之间的分隔线即可调整列宽；表格优先铺满窗口，"
+                      "列太多放不下时会出现横向滚动条")
         hh.sectionResized.connect(self._on_flex_resized)
         try:
-            self.verticalScrollBar().rangeChanged.connect(lambda *_: self._flex_fill())
+            # 竖向滚动条出现/消失会改变视口宽度 → 需要重新适配
+            self.verticalScrollBar().rangeChanged.connect(self._flex_layout_evt)
+            # 横向滚动按像素走，才能平滑拖动（默认是"按列跳"，滚动条范围也不是像素）
+            self.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         except AttributeError:
             pass
 
+    def set_flex_minimums(self, mins) -> None:
+        """
+        设定各列下限，并把当前各列宽度记作「设计列宽」。
+
+        各页在设置完设计列宽之后紧接着调用；下限主要用于自动让位与窗口缩放时的保护。
+        """
+        self._flex_minw = [max(int(self._flex_min), int(m)) for m in mins]
+        self._flex_design = [int(self.columnWidth(i)) for i in range(self._flex_n)]
+        self._flex_w = [float(x) for x in self._flex_design]
+        self._flex_fill()
+
+    def reset_flex(self) -> None:
+        """恢复各列的设计列宽（拖动改乱后可一键复位），并按当前窗口重新适配。"""
+        if not self._flex_design:
+            return
+        self._flex_w = [float(x) for x in self._flex_design]
+        vp = self.viewport().width()
+        if vp > 20:
+            self._flex_adapt(vp)
+            self._flex_last_vp = vp
+        self._flex_fill()
+
     # ------------------------------------------------------------------ 内部
+    def _flex_adapt(self, vp: int) -> None:
+        """
+        把各列目标宽度缩放到"刚好适配当前视口"。
+
+        目标总宽 = max(视口宽, 各列下限之和)：
+          * 视口够宽 → 缩放到正好铺满；
+          * 下限之和更大（列太多/窗口太窄）→ 缩放到下限为止，剩下的交给横向滚动。
+
+        用迭代而不是一次缩放：某些列撞到下限后会把"省不下来"的宽度顶回去，
+        一次缩放就收敛不到目标（实测会多出十几像素），需要再把这些差额摊给还没触底的列。
+        """
+        n = self._flex_n
+        mins = self._flex_minw or [self._flex_min] * n
+        new = [float(x) for x in (self._flex_w or mins)]
+        target = float(max(vp, sum(mins)))
+        for _ in range(8):
+            cur = float(sum(new)) or 1.0
+            k = target / cur
+            nxt = [max(float(mins[i]), new[i] * k) for i in range(n)]
+            done = all(abs(nxt[i] - new[i]) < 0.5 for i in range(n))
+            new = nxt
+            if done:
+                break
+        self._flex_w = new
+
     def _flex_widths(self, vp: int) -> List[int]:
-        """按权重把 vp 像素分给各列，总和尽量正好等于 vp，并尊重最小列宽。"""
+        """
+        按绝对目标宽度分配；有富余就按目标宽度的比例补满，没有富余就维持原样（横向滚动）。
+        """
         n = self._flex_n
         w = self._flex_w or [1.0] * n
-        total = sum(w) or 1.0
-        out = [max(self._flex_min, int(round(vp * x / total))) for x in w]
-        diff = vp - sum(out)
-        if diff:
-            # 取整误差补到最宽的那一列，避免出现 1px 的缝隙
-            i = max(range(n), key=lambda k: out[k])
-            out[i] = max(self._flex_min, out[i] + diff)
+        out = [max(int(self._flex_min), int(round(x))) for x in w]
+        slack = vp - sum(out)
+        if slack > 0:
+            tw = sum(w) or 1.0
+            extra = [slack * w[i] / tw for i in range(n)]
+            add = [int(e) for e in extra]
+            order = sorted(range(n), key=lambda i: extra[i] - add[i], reverse=True)
+            for k in range(slack - sum(add)):
+                add[order[k % n]] += 1
+            out = [out[i] + add[i] for i in range(n)]
+        elif -slack <= n:
+            # 取整让合计比视口多出几像素 → 从最宽的列上扣回来，保证正好铺满
+            order = sorted(range(n), key=lambda i: out[i], reverse=True)
+            for k in range(-slack):
+                i = order[k % n]
+                if out[i] > self._flex_min:
+                    out[i] -= 1
         return out
 
-    def _flex_fill(self):
+    def _flex_fill(self, recheck: bool = True):
+        """把当前目标宽度落到各列上；顺带自愈——发现视口变了就重新适配。"""
         if self._flex_busy or self._flex_n <= 0:
             return
         vp = self.viewport().width()
@@ -178,6 +251,10 @@ class _FlexCols:
         if self._flex_w is None:
             self._flex_w = [max(1.0, float(self.columnWidth(i)))
                             for i in range(self._flex_n)]
+        old = self._flex_last_vp
+        if old and old > 20 and vp != old:
+            self._flex_adapt(vp)
+        self._flex_last_vp = vp
         widths = self._flex_widths(vp)
         if all(self.columnWidth(i) == widths[i] for i in range(self._flex_n)):
             return
@@ -185,6 +262,9 @@ class _FlexCols:
         for i, wd in enumerate(widths):
             self.setColumnWidth(i, wd)
         self._flex_busy = False
+        if recheck:
+            # 列宽变化可能让滚动条出现/消失，视口宽度随之变化 → 下一轮事件循环再校正一次
+            QTimer.singleShot(0, lambda: self._flex_fill(False))
 
     def _on_flex_resized(self, index, _old, new):
         if self._flex_busy or not self._flex_ready or index >= self._flex_n:
@@ -195,32 +275,41 @@ class _FlexCols:
         if self._flex_w is None:
             self._flex_w = [max(1.0, float(self.columnWidth(i)))
                             for i in range(self._flex_n)]
+        mins = self._flex_minw or [self._flex_min] * self._flex_n
         others = [i for i in range(self._flex_n) if i != index]
         if not others:
             return
         cur = [max(1.0, float(self.columnWidth(i))) for i in range(self._flex_n)]
-        others_sum = sum(cur[i] for i in others)
-        # 拖动列拿到用户要的宽度，剩下的宽度由其它列按原比例分摊
-        rest = max(float(self._flex_min) * len(others), vp - float(new))
-        k = rest / others_sum if others_sum > 0 else 1.0
-        w = [0.0] * self._flex_n
-        w[index] = max(float(self._flex_min), float(new))
-        for i in others:
-            w[i] = max(1.0, cur[i] * k)
+        w = list(cur)
+        w[index] = max(float(self._flex_min), float(new))   # 允许用户拖得很窄
+        if sum(cur) <= vp + 2:
+            # 表格当前还装得下 → 其余列按比例让位/补位（但不低于各自下限）
+            others_sum = sum(cur[i] for i in others)
+            floor = sum(float(mins[i]) for i in others)
+            rest = max(floor, vp - float(new))
+            k = rest / others_sum if others_sum > 0 else 1.0
+            for i in others:
+                w[i] = max(float(mins[i]), cur[i] * k)
+        # 已经超宽（正在横向滚动）→ 只改这一列，不去挤别人
         self._flex_w = w
         self._flex_fill()
 
     # ------------------------------------------------------------------ 事件
+    def _flex_layout_evt(self, *_):
+        """视口尺寸变了（窗口缩放 / 滚动条出现）→ 重新适配列宽。"""
+        self._flex_fill()
+
     def resizeEvent(self, e):
         super().resizeEvent(e)
         self._flex_fill()
 
     def showEvent(self, e):
         super().showEvent(e)
-        if not self._flex_ready:
-            self._flex_w = [max(1.0, float(self.columnWidth(i)))
-                            for i in range(self._flex_n)]
-            self._flex_ready = True
+        self._flex_ready = True
+        vp = self.viewport().width()
+        if vp > 20 and self._flex_w:
+            self._flex_adapt(vp)
+            self._flex_last_vp = vp
         self._flex_fill()
 
 
@@ -301,6 +390,7 @@ class InitPage(QWidget):
     def __init__(self, win):
         super().__init__()
         self.win = win
+        self._tree_busy = False
         n1, n2, n3, n4 = core.tree_counts()
 
         root = QVBoxLayout(self)
@@ -334,13 +424,21 @@ class InitPage(QWidget):
         c1.body.addLayout(crate)
         root.addWidget(c1)
 
-        # —— 结构预览
-        c2 = Card("分类目录预览", f"依据《科研数据元信息采集·目录分类树》生成："
-                                 f"一级分类 {n1} 个、二级分类 {n2} 个。"
-                                 f"（分类树同时定义了三、四级分类，共 {n3} / {n4} 个，可作为细分参考。）", "2")
+        # —— 结构预览（可勾选，只创建需要的分类）
+        c2 = Card("选择要创建的分类目录",
+                  f"依据《科研数据元信息采集·目录分类树》：一级 {n1} 个、二级 {n2} 个"
+                  f"（三、四级共 {n3} / {n4} 个，可作为细分参考）。"
+                  f"只有勾选的目录会被创建 —— 不需要的分类取消勾选即可；"
+                  f"勾选子目录时，其上级目录会自动一起建出来。", "2")
         bar = QHBoxLayout()
-        self.chk_l3 = QCheckBox("同时创建三级分类子目录（便于进一步细分，可选）")
-        self.chk_l3.toggled.connect(self._refresh_tree)
+        self.chk_l3 = QCheckBox("同时列出三级分类子目录（可选）")
+        self.chk_l3.toggled.connect(self._on_l3_toggled)
+        b_all = QPushButton("全选")
+        b_all.setObjectName("ghost")
+        b_all.clicked.connect(lambda: self._set_all(True))
+        b_none = QPushButton("全不选")
+        b_none.setObjectName("ghost")
+        b_none.clicked.connect(lambda: self._set_all(False))
         btn_exp = QPushButton("展开全部")
         btn_exp.setObjectName("ghost")
         btn_exp.clicked.connect(lambda: self.tree.expandAll())
@@ -349,20 +447,30 @@ class InitPage(QWidget):
         btn_col.clicked.connect(lambda: self.tree.collapseAll())
         bar.addWidget(self.chk_l3)
         bar.addStretch(1)
+        bar.addWidget(b_all)
+        bar.addWidget(b_none)
         bar.addWidget(btn_exp)
         bar.addWidget(btn_col)
         c2.body.addLayout(bar)
 
         self.tree = CatTree(3)
-        self.tree.setHeaderLabels(["分类目录", "层级", "包含的三级 / 四级分类"])
+        self.tree.setHeaderLabels(["分类目录（勾选要创建的）", "层级",
+                                   "包含的三级 / 四级分类"])
         self.tree.setColumnWidth(0, 300)
         self.tree.setColumnWidth(1, 92)
         self.tree.setColumnWidth(2, 360)
+        self.tree.set_flex_minimums((190, 76, 170))
         self.tree.setAlternatingRowColors(False)
         self.tree.setRootIsDecorated(True)
         self.tree.setUniformRowHeights(True)
         self.tree.setMinimumHeight(200)
+        self.tree.itemChanged.connect(self._on_item_changed)
         c2.body.addWidget(self.tree, 1)
+
+        self.lb_sel = QLabel("")
+        self.lb_sel.setObjectName("muted")
+        self.lb_sel.setWordWrap(True)
+        c2.body.addWidget(self.lb_sel)
         root.addWidget(c2, 1)
 
         # —— 执行
@@ -394,34 +502,178 @@ class InitPage(QWidget):
         self._refresh_tree()
 
     # ------------------------------------------------------------------ 逻辑
-    def _refresh_tree(self):
-        self.tree.clear()
-        l3 = self.chk_l3.isChecked()
-        for a, d2 in core.TREE.items():
-            it1 = QTreeWidgetItem([core.safe_name(a), "一级目录", f"{len(d2)} 个二级分类"])
-            it1.setIcon(0, skin.icon("folder", 16, PRIMARY))
-            f = QFont()
-            f.setBold(True)
-            it1.setFont(0, f)
-            for l2, d3 in d2.items():
-                names = list(d3.keys())
-                fourth = sum(len(v) for v in d3.values())
-                tip = ""
-                if names:
-                    tip = "、".join(names)
+    def _collect_checks(self):
+        """把当前勾选状态收成 {(一级,), (一级,二级), (一级,二级,三级)} 的集合。"""
+        sel = set()
+        for i in range(self.tree.topLevelItemCount()):
+            it1 = self.tree.topLevelItem(i)
+            n1 = it1.data(0, Qt.UserRole)
+            if it1.checkState(0) == Qt.Checked:
+                sel.add((n1,))
+            for j in range(it1.childCount()):
+                it2 = it1.child(j)
+                n2 = it2.data(0, Qt.UserRole)
+                if it2.checkState(0) == Qt.Checked:
+                    sel.add((n1, n2))
+                for k in range(it2.childCount()):
+                    it3 = it2.child(k)
+                    if it3.checkState(0) == Qt.Checked:
+                        sel.add((n1, n2, it3.data(0, Qt.UserRole)))
+        return sel
+
+    def _refresh_tree(self, sel=None):
+        """重建分类树。sel 为 None 时默认全部勾选。"""
+        if sel is None and self.tree.topLevelItemCount():
+            sel = self._collect_checks()      # 记住用户当前的选择
+        self._tree_busy = True
+        try:
+            self.tree.clear()
+            show_l3 = self.chk_l3.isChecked()
+            # 该二级下是否已经有"三级勾选信息"（用于决定新列出的三级默认是否勾上）
+            has_l3_info = {k[:2] for k in (sel or ()) if len(k) == 3}
+
+            def checked(key, parent_key=None, inherit=False):
+                """inherit=True 只用于三级项：刚展开三级时继承所属二级的勾选状态。"""
+                if sel is None:
+                    return True
+                if key in sel:
+                    return True
+                return bool(inherit and parent_key and parent_key in sel
+                            and parent_key not in has_l3_info)
+
+            for a, d2 in core.TREE.items():
+                it1 = QTreeWidgetItem([core.safe_name(a), "一级目录",
+                                       f"{len(d2)} 个二级分类"])
+                it1.setData(0, Qt.UserRole, a)
+                it1.setIcon(0, skin.icon("folder", 16, PRIMARY))
+                f = QFont()
+                f.setBold(True)
+                it1.setFont(0, f)
+                it1.setFlags(it1.flags() | Qt.ItemIsUserCheckable)
+                it1.setCheckState(0, Qt.Checked if checked((a,)) else Qt.Unchecked)
+                for l2, d3 in d2.items():
+                    names = list(d3.keys())
+                    fourth = sum(len(v) for v in d3.values())
+                    tip = "、".join(names) if names else ""
                     if fourth:
                         tip += f"（含 {fourth} 个四级分类）"
-                it2 = QTreeWidgetItem([core.safe_name(l2), "二级目录", tip or "—"])
-                it2.setIcon(0, skin.icon("folder", 15, skin.TEXT_SUB))
-                if l3 and d3:
-                    for l3name in d3:
-                        it3 = QTreeWidgetItem([core.safe_name(l3name), "三级目录",
-                                               "、".join(d3[l3name]) or "—"])
-                        it3.setForeground(1, QColor(TEXT_MUTED))
-                        it2.addChild(it3)
-                it1.addChild(it2)
-            self.tree.addTopLevelItem(it1)
-        self.tree.expandToDepth(0)
+                    it2 = QTreeWidgetItem([core.safe_name(l2), "二级目录", tip or "—"])
+                    it2.setData(0, Qt.UserRole, l2)
+                    it2.setIcon(0, skin.icon("folder", 15, skin.TEXT_SUB))
+                    it2.setFlags(it2.flags() | Qt.ItemIsUserCheckable)
+                    it2.setCheckState(
+                        0, Qt.Checked if checked((a, l2)) else Qt.Unchecked)
+                    if show_l3:
+                        for l3name in d3:
+                            it3 = QTreeWidgetItem(
+                                [core.safe_name(l3name), "三级目录",
+                                 "、".join(d3[l3name]) or "—"])
+                            it3.setData(0, Qt.UserRole, l3name)
+                            it3.setForeground(1, QColor(TEXT_MUTED))
+                            it3.setFlags(it3.flags() | Qt.ItemIsUserCheckable)
+                            it3.setCheckState(
+                                0, Qt.Checked
+                                if checked((a, l2, l3name), (a, l2), inherit=True)
+                                else Qt.Unchecked)
+                            it2.addChild(it3)
+                    it1.addChild(it2)
+                self.tree.addTopLevelItem(it1)
+            self.tree.expandToDepth(0)
+        finally:
+            self._tree_busy = False
+        self._update_sel()
+
+    def _on_item_changed(self, item, col):
+        if self._tree_busy or col != 0:
+            return
+        self._tree_busy = True
+        try:
+            state = item.checkState(0)
+            # 勾选/取消父项 → 级联到整棵子树
+            stack = [item]
+            while stack:
+                cur = stack.pop()
+                for c in range(cur.childCount()):
+                    ch = cur.child(c)
+                    if ch.checkState(0) != state:
+                        ch.setCheckState(0, state)
+                    stack.append(ch)
+            # 勾选了子项 → 上级目录自动勾上（父目录必须存在）
+            if state == Qt.Checked:
+                p = item.parent()
+                while p is not None:
+                    if p.checkState(0) != Qt.Checked:
+                        p.setCheckState(0, Qt.Checked)
+                    p = p.parent()
+        finally:
+            self._tree_busy = False
+        self._update_sel()
+
+    def _set_all(self, on: bool):
+        self._tree_busy = True
+        state = Qt.Checked if on else Qt.Unchecked
+        try:
+            for i in range(self.tree.topLevelItemCount()):
+                it = self.tree.topLevelItem(i)
+                it.setCheckState(0, state)
+                for j in range(it.childCount()):
+                    c2 = it.child(j)
+                    c2.setCheckState(0, state)
+                    for k in range(c2.childCount()):
+                        c2.child(k).setCheckState(0, state)
+        finally:
+            self._tree_busy = False
+        self._update_sel()
+
+    def _on_l3_toggled(self, _checked):
+        self._refresh_tree(self._collect_checks())
+
+    def _selected_dirs(self):
+        """按勾选状态生成待创建的相对目录列表。"""
+        out = []
+        for i in range(self.tree.topLevelItemCount()):
+            it1 = self.tree.topLevelItem(i)
+            if it1.checkState(0) != Qt.Checked:
+                continue
+            d1 = core.safe_name(it1.data(0, Qt.UserRole))
+            out.append(d1)
+            for j in range(it1.childCount()):
+                it2 = it1.child(j)
+                if it2.checkState(0) != Qt.Checked:
+                    continue
+                d2 = os.path.join(d1, core.safe_name(it2.data(0, Qt.UserRole)))
+                out.append(d2)
+                for k in range(it2.childCount()):
+                    it3 = it2.child(k)
+                    if it3.checkState(0) == Qt.Checked:
+                        out.append(os.path.join(
+                            d2, core.safe_name(it3.data(0, Qt.UserRole))))
+        return out
+
+    def _update_sel(self):
+        dirs = self._selected_dirs()
+        n1 = sum(1 for d in dirs if os.sep not in d)
+        n2 = sum(1 for d in dirs if d.count(os.sep) == 1)
+        n3 = sum(1 for d in dirs if d.count(os.sep) == 2)
+        parts = [f"一级 {n1} 个", f"二级 {n2} 个"]
+        if n3 or self.chk_l3.isChecked():
+            parts.append(f"三级 {n3} 个")
+        if not dirs:
+            self.lb_sel.setText("● 未勾选任何目录，无法初始化。请至少勾选一个。")
+            self.lb_sel.setObjectName("danger")
+        else:
+            all_dirs = core.plan_dirs(3 if self.chk_l3.isChecked() else 2)
+            extra = ""
+            if len(dirs) < len(all_dirs):
+                extra = f"（完整分类树为 {len(all_dirs)} 个，其余不会创建）"
+            self.lb_sel.setText("● 将创建：" + " · ".join(parts)
+                                + f"，合计 {len(dirs)} 个目录 {extra}")
+            self.lb_sel.setObjectName("muted")
+        self._restyle(self.lb_sel)
+        if hasattr(self, "btn_init"):
+            # 两个条件都满足才让点：勾了目录 + 路径可用
+            self.btn_init.setEnabled(bool(dirs) and self._path_ok())
+        self._refresh_open_btn()
 
     def pick(self):
         d = QFileDialog.getExistingDirectory(
@@ -430,28 +682,37 @@ class InitPage(QWidget):
         if d:
             self.ed_path.setText(os.path.normpath(d))
 
+    def _path_ok(self):
+        p = self.ed_path.text().strip()
+        if not p:
+            return False
+        if core.is_initialized(p):
+            return True
+        ok, _ = core.check_empty_target(p)
+        return ok
+
+    def _refresh_open_btn(self):
+        p = self.ed_path.text().strip()
+        self.btn_open.setEnabled(bool(p) and os.path.isdir(p))
+
     def _on_path_changed(self, text):
-        self.btn_open.setEnabled(False)
         p = text.strip()
         if not p:
             self.lb_path_state.setText("尚未选择路径")
             self.lb_path_state.setObjectName("muted")
             self.lb_path_name.setText("")
             self._restyle(self.lb_path_state)
-            self.btn_init.setEnabled(False)
+            self._update_sel()
             return
         if core.is_initialized(p):
             self.lb_path_state.setText("● 该目录已经初始化，可直接用于归档")
             self.lb_path_state.setObjectName("ok")
-            self.btn_init.setText("  重新初始化（补齐缺失目录）")
-            self.btn_open.setEnabled(True)
-            self.btn_init.setEnabled(True)
+            self.btn_init.setText("  补齐勾选的分类目录")
         else:
             ok, msg = core.check_empty_target(p)
-            self.lb_path_state.setText(("● " + msg) if ok else ("● " + msg))
+            self.lb_path_state.setText("● " + msg)
             self.lb_path_state.setObjectName("ok" if ok else "danger")
             self.btn_init.setText("  初始化归档目录")
-            self.btn_init.setEnabled(ok)
         try:
             parent = os.path.dirname(os.path.abspath(p))
             self.lb_path_name.setText("父目录可写：" + ("是" if os.access(parent, os.W_OK) else "否")
@@ -459,6 +720,7 @@ class InitPage(QWidget):
         except Exception:
             self.lb_path_name.setText("")
         self._restyle(self.lb_path_state)
+        self._update_sel()
 
     @staticmethod
     def _restyle(w):
@@ -470,16 +732,35 @@ class InitPage(QWidget):
         if not p:
             return
         levels = 3 if self.chk_l3.isChecked() else 2
-        total = len(core.plan_dirs(levels))
+        sel = core.norm_dirs(self._selected_dirs())
+        if not sel:
+            QMessageBox.information(self, "提示", "请至少勾选一个要创建的分类目录。")
+            return
+        full = core.plan_dirs(levels)
+        # 勾的正好是完整分类树 → 按整体初始化处理（说明文件里不必标成"部分初始化"）
+        dirs = None if set(sel) >= set(full) else sel
+        total = len(sel)
+        n1 = sum(1 for d in sel if os.sep not in d)
+        n2 = sum(1 for d in sel if d.count(os.sep) == 1)
+        n3 = sum(1 for d in sel if d.count(os.sep) == 2)
+        detail = f"一级 {n1} 个 · 二级 {n2} 个" + (f" · 三级 {n3} 个" if n3 else "")
+        if dirs is None:
+            detail += f"（完整分类树，共 {total} 个目录）"
+        else:
+            detail += f"（完整分类树共 {len(full)} 个，你未勾选的 {len(full) - total} 个不会创建）"
+
         if core.is_initialized(p):
             if QMessageBox.question(
-                    self, "确认", f"该目录已初始化。是否重新扫描并补齐缺失目录？\n\n{os.path.normpath(p)}"
+                    self, "确认",
+                    f"该目录已初始化。将创建其中缺失的目录（已存在的不动）：\n\n"
+                    f"{os.path.normpath(p)}\n\n{detail}\n\n是否继续？"
             ) != QMessageBox.Yes:
                 return
         else:
             if QMessageBox.question(
                     self, "确认初始化",
                     f"将在以下路径创建 {total} 个分类目录：\n\n{os.path.normpath(p)}\n\n"
+                    f"{detail}\n\n"
                     f"同时写入《归档说明.md》与索引文件。是否继续？"
             ) != QMessageBox.Yes:
                 return
@@ -490,7 +771,7 @@ class InitPage(QWidget):
         self.lb_res.setText("正在创建…")
 
         def job(cb):
-            return core.init_archive(p, levels, lambda i, t, rel: cb(i, t, rel))
+            return core.init_archive(p, levels, lambda i, t, rel: cb(i, t, rel), dirs)
 
         self.worker = FnWorker(job)
         self.worker.progress.connect(
@@ -502,18 +783,25 @@ class InitPage(QWidget):
 
     def _init_done(self, manifest):
         self.prog.setVisible(False)
-        n1, n2, _, _ = core.tree_counts()
-        self.lb_res.setText(f"✓ 初始化完成：{n1} 个一级目录、{n2} 个二级目录")
+        folders = manifest.get("folders") or []
+        n1 = sum(1 for d in folders if os.sep not in d)
+        n2 = sum(1 for d in folders if d.count(os.sep) == 1)
+        n3 = sum(1 for d in folders if d.count(os.sep) == 2)
+        cnt = f"{n1} 个一级 / {n2} 个二级" + (f" / {n3} 个三级" if n3 else "")
+        self.lb_res.setText(f"✓ 初始化完成：{cnt}")
         self.lb_res.setObjectName("ok")
         self._restyle(self.lb_res)
-        self.btn_open.setEnabled(True)
+        self._refresh_open_btn()
         self.btn_init.setEnabled(True)
         self.initialized.emit(manifest["root"])
+        tag = "（部分初始化）" if manifest.get("partial") else ""
         QMessageBox.information(
             self, "初始化完成",
-            f"归档目录已创建完成。\n\n路径：{manifest['root']}\n"
-            f"一级目录 {n1} 个 / 二级目录 {n2} 个\n\n"
-            f"提示：目录中的《归档说明.md》列出了完整的分类结构与含义，可随时查阅。")
+            f"归档目录已创建完成{tag}。\n\n路径：{manifest['root']}\n"
+            f"本次创建 {cnt}，合计 {len(folders)} 个目录\n\n"
+            f"提示：目录中的《归档说明.md》列出了实际创建的分类结构与含义，可随时查阅。\n"
+            f"需要补建其它分类时，在本页重新勾选后再点『补齐勾选的分类目录』即可，"
+            f"已存在的数据不会受影响。")
 
     def _init_fail(self, msg):
         self.prog.setVisible(False)
@@ -634,6 +922,7 @@ class ArchivePage(QWidget):
         self.tb_files.setColumnWidth(3, 84)
         self.tb_files.setColumnWidth(4, 340)
         self.tb_files.setColumnWidth(5, 98)
+        self.tb_files.set_flex_minimums((52, 40, 160, 72, 150, 88))
         c2.body.addWidget(self.tb_files, 1)
         root.addWidget(c2, 1)
 
@@ -1370,6 +1659,7 @@ class CheckPage(QWidget):
         self.tb.setColumnWidth(2, 420)
         self.tb.setColumnWidth(3, 84)
         self.tb.setColumnWidth(4, 146)
+        self.tb.set_flex_minimums((36, 150, 150, 72, 120))
         self.tb.itemChanged.connect(self._on_item_changed)
         self.tb.doubleClicked.connect(lambda idx: self.open_file())
         c2.body.addWidget(self.tb, 1)
@@ -1832,11 +2122,16 @@ class LedgerPage(QWidget):
         self.tb.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.tb.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.tb.setMinimumHeight(170)
-        # 设计列宽只决定各列的相对比例（表格始终铺满窗口，会按比例缩放）
-        for i, w in enumerate((160, 150, 168, 58, 86, 92, 140, 84, 230, 200)):
+        # 设计列宽之和已超过常见窗口宽度 → 保持设计宽度并横向滚动，保证内容读得全。
+        # 下限就取设计宽度，这样窗口变窄时也不会把这 10 列压到读不清。
+        # 前三列按"能完整显示不省略"来定：时间戳 19 字符、一级/二级分类各 11/10 个汉字。
+        LEDGER_W = (166, 156, 150, 52, 80, 86, 120, 80, 235, 215)
+        for i, w in enumerate(LEDGER_W):
             self.tb.setColumnWidth(i, w)
+        self.tb.set_flex_minimums(LEDGER_W)
         c2.body.addWidget(self.tb, 1)
-        self.lb_tip = QLabel("提示：上表是台账的汇总视图；完整 30 列数据在 "
+        self.lb_tip = QLabel("提示：上表是台账的汇总视图，列较多时可左右拖动表头调宽，"
+                             "或拖动表格下方的横向滚动条查看右侧列；完整 30 列数据在 "
                              "_归档索引/科研数据元信息台账.csv，导出的 xlsx 按官方分 sheet 排布。")
         self.lb_tip.setObjectName("muted")
         self.lb_tip.setWordWrap(True)
@@ -2009,9 +2304,15 @@ HELP_TEXT = """
 <p style="color:#5A6B84;margin:0 0 14px 0;">无需培训，按左侧导航从上到下操作即可。</p>
 
 <p><b>① 初始化归档目录</b><br>
-选择一个<b>空的文件夹</b>（或尚不存在的路径）作为归档根目录。软件依据《科研数据元信息采集·目录分类树》
-在此创建 <b>5 个一级分类</b>、<b>30 个二级分类</b> 文件夹，并生成《归档说明.md》与归档索引。
-一个归档根目录只需初始化一次，之后可反复使用。</p>
+选择一个<b>空的文件夹</b>（或尚不存在的路径）作为归档根目录，然后在下方分类树里<b>勾选要创建的分类</b>，
+点『初始化归档目录』即可。<br>
+· <b>只创建勾选的那部分</b>——不需要的一级/二级/三级分类取消勾选就不会建出来，
+  分类树总共 5 个一级、30 个二级（另有三、四级共 76 / 251 个可作细分参考）；
+· 勾选某个子目录时，它的上级目录会<b>自动一起建出来</b>（父目录必须存在）；
+  『全选 / 全不选』可一键切换，底部会实时显示"将创建 一级 x 个 · 二级 y 个 · 合计 n 个目录"；
+· 勾『同时列出三级分类子目录』可以把三级也纳入选择；
+· 选多了或后来需要补：再勾上缺失的，点『补齐勾选的分类目录』即可，<b>已建目录与已有数据不受影响</b>；
+· 初始化会生成《归档说明.md》（只列实际创建的目录）与归档索引。一个归档根目录只需初始化一次。</p>
 
 <p><b>② 文件归档</b><br>
 先选择归档根目录，然后用『扫描文件夹』或『添加文件』把候选数据<b>先放进下方列表预览</b>；
@@ -2057,8 +2358,9 @@ HELP_TEXT = """
 <li><b>主操作按钮固定在窗口底部</b>：『初始化归档目录』『开始归档』『导出问题文件清单』『导出 Excel 台账』
     始终显示在底部操作条上，内容再长也不用滚动去找。</li>
 <li><b>表格列宽都能拖动调整</b>：把鼠标移到表头两列之间的<b>分隔线</b>上，光标变成左右箭头后拖动即可。
-    表格<b>始终铺满整个窗口宽度</b>——把某一列拖宽，其余列会自动让出空间，右侧不会留下空白，
-    也不会冒出横向滚动条；文件名、路径等较长的内容可以拖宽了看。</li>
+    列少的表会<b>按比例铺满窗口</b>——把某一列拖宽，其余列自动让出空间；
+    列多的表（如数据台账 10 列）<b>不会把列压到读不清</b>，放不下时表格下方会出现<b>横向滚动条</b>，
+    拖动它即可查看右侧的列。</li>
 <li>分类名中的 <code>/</code> 等 Windows 非法字符会替换为全角字符（如 <code>粒度/颗粒/粉末分析</code> → <code>粒度／颗粒／粉末分析</code>）。</li>
 <li>『智能推荐』依据文件名关键词给出建议，<b>仅供参考</b>，请务必人工确认。</li>
 <li>归档根目录下的 <code>_归档索引</code> 是软件的数据目录，请勿手工删改。</li>
