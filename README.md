@@ -78,17 +78,63 @@ bash mac/build_mac.sh
 > 关于 runner 标签：`macos-13` 已于 2025-12-04 完全退役、`macos-14` 于 2026-11-02 EOL，
 > 因此工作流使用 `macos-15`(arm64) 与 `macos-15-intel`(x86_64)。
 
-### 首次打开 macOS 版被拦下？
+---
 
-未签名的应用会被 Gatekeeper 拦截，任选一种：
+## 把安装包发给别人
 
+可以。CI 产出的 `.dmg`（内含 App + `Applications` 软链 + `首次打开请看这里.txt`）就是标准的
+macOS 分发包；`.zip` 也已把说明文件一并打进去，可以直接转发。
+
+**唯一要注意的是 Apple 的 Gatekeeper**：本项目没有 Apple 开发者证书，未做**公证（notarize）**，
+所以对方第一次打开会被拦一次。PyInstaller 会对 `.app` 做 **ad-hoc 签名**（不给证书时
+`codesign -s -`），所以 App 能跑，只是拿不到 Apple 的"可信"背书。
+
+### 对方（macOS 15 及以上）的放行步骤
+
+> ⚠️ **「右键 → 打开」这个老办法从 macOS 15 (Sequoia) 起已被 Apple 取消**，别再用它。
+
+**方式一（推荐，不用敲命令）**
+1. 把 App 拖进「应用程序」
+2. 双击打开，弹出「无法打开 / 无法验证开发者」后点「完成」
+3. 打开 **系统设置 → 隐私与安全性**，往下滚到「安全性」
+4. 看到「已阻止使用"科研数据归档助手"…」→ 点「**仍要打开**」→ 再确认一次，输入开机密码
+5. 之后即可正常双击打开
+
+**方式二（终端一条命令）**
 ```bash
-# A. 右键点图标 → 打开 → 再点“打开”（只需一次）
-# B. 终端执行：
-xattr -dr com.apple.quarantine "/Applications/科研数据归档助手.app"
+xattr -cr "/Applications/科研数据归档助手.app"
 ```
 
-正式对外分发需要 Apple 开发者账号做 `codesign` + `notarize`。
+### 想彻底免掉这一步？
+
+只能走 Apple 官方路径，没有别的办法：
+
+1. 加入 **Apple Developer Program**（99 美元/年）
+2. 申请 **Developer ID Application** 证书，导出为 `.p12`
+3. 在 CI 里注入证书与 Apple ID 凭据（仓库 Secrets），把构建改成：
+   ```bash
+   # 1) 用开发者证书签名（替换掉 PyInstaller 的 ad-hoc 签名）
+   codesign --force --deep --options=runtime --timestamp \
+            --sign "Developer ID Application: 你的名字 (TEAMID)" \
+            "科研数据归档助手.app"
+   # 2) 打成 dmg 后提交公证
+   xcrun notarytool submit "科研数据归档助手.dmg" \
+         --apple-id "$APPLE_ID" --team-id "$TEAM_ID" --password "$APP_PWD" --wait
+   # 3) 把公证票据钉进去（关键，否则离线也照样拦）
+   xcrun stapler staple "科研数据归档助手.dmg"
+   ```
+4. 之后任何人下载双击即可打开，不再有任何提示。
+
+> 顺带说明：**打成 `.pkg` 安装包并不能绕过这一步**——未签名的 `.pkg` 同样会被 Gatekeeper 拦住
+> （提示"安装包不符合 Gatekeeper 策略"），而且还要输管理员密码，体验反而更差。
+> 对未签名的应用来说，`.dmg` +「拖进应用程序」才是最合适的分发格式。
+
+### 不想让使用者操作任何一步？
+
+把安装包**通过 U 盘 / 局域网共享 / AirDrop 之外的本地拷贝**给同事即可：
+macOS 的隔离属性（`com.apple.quarantine`）是**下载程序**（浏览器、邮件、微信）打上的，
+从 U 盘或网络共享直接拷贝过去的文件不带这个标记，双击就能开，没有任何提示。
+一旦经由聊天工具或网盘传输，就会被标记，需要走上面的放行步骤。
 
 ---
 

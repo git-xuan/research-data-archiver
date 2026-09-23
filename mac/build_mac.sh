@@ -122,15 +122,52 @@ APP_PATH="dist-mac/$APP_NAME.app"
 echo "== 生成: $APP_PATH"
 
 # 4) 生成 dmg（可选） -------------------------------------------------------
+# 首次打开说明：写进 dmg，让拿到安装包的人自己看得懂怎么放行
+write_firstrun_note() {
+  cat > "$1" <<'NOTE'
+科研数据归档助手 —— 首次打开说明
+==================================
+
+这个应用没有购买 Apple 开发者证书做「公证」，所以 macOS 第一次会拦它。
+这是正常的，不是因为文件坏了。按下面任一种方式放行，只需一次。
+
+方式一（推荐，不用敲命令）
+  1. 先按正常流程把「科研数据归档助手」拖进「应用程序」文件夹
+  2. 双击打开它，会弹出「无法打开 / 无法验证开发者」的提示
+  3. 点「完成」，然后打开  系统设置 → 隐私与安全性
+  4. 往下滚到「安全性」一栏，会看到「已阻止使用"科研数据归档助手"…」
+  5. 点旁边的「仍要打开」，再确认一次「仍要打开」，输入开机密码
+  6. 之后就能像正常软件一样双击打开了
+
+方式二（熟悉终端的话，一条命令搞定）
+  打开「终端」，粘贴执行：
+
+      xattr -cr "/Applications/科研数据归档助手.app"
+
+  然后双击即可。
+
+注意
+  · macOS 15 (Sequoia) 及以后，Apple 取消了「右键 → 打开」这个老办法，
+    所以别再用右键了，请走上面方式一或方式二。
+  · 应用本身不含联网、上传等行为，数据全部在本机处理。
+
+系统要求
+  · Apple Silicon 机器请用文件名带 arm64 的安装包
+  · Intel 机器请用文件名带 x86_64 的安装包
+  · 建议 macOS 12 及以上
+NOTE
+}
+
 if [ "$SKIP_DMG" != "1" ]; then
   echo "== 生成 dmg"
-  # 做一个标准的分发目录：App + 指向 /Applications 的软链，
+  # 做一个标准的分发目录：App + 指向 /Applications 的软链 + 首次打开说明，
   # 用户打开 dmg 后直接把 App 拖进去即可。
   STAGE="dist-mac/.dmg-stage"
   rm -rf "$STAGE"
   mkdir -p "$STAGE"
   cp -R "$APP_PATH" "$STAGE/"
   ln -s /Applications "$STAGE/Applications"
+  write_firstrun_note "$STAGE/首次打开请看这里.txt"
   rm -f "dist-mac/$APP_NAME.dmg"
   hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE" \
                  -ov -format UDZO "dist-mac/$APP_NAME.dmg"
@@ -138,14 +175,21 @@ if [ "$SKIP_DMG" != "1" ]; then
   echo "== 生成: dist-mac/$APP_NAME.dmg"
 fi
 
+# 单独再放一份说明到 dist-mac/，方便连同 zip 一起转发
+write_firstrun_note "dist-mac/首次打开请看这里.txt"
+
 cat <<'EOT'
 
 ------------------------------------------------------------------
-完成。首次运行若被 Gatekeeper 拦下（提示"未验证的开发者"），任选一种：
+完成。
 
-  A. 右键点图标 → 打开 → 再点"打开"（只需一次）
-  B. 终端执行： xattr -dr com.apple.quarantine "应用程序/科研数据归档助手.app"
-  C. 正式分发请在 Apple 开发者账号下做 codesign + notarize
+首次打开若被 Gatekeeper 拦下（提示"无法验证开发者"），任选一种：
+  A. 系统设置 → 隐私与安全性 → 往下滚到「安全性」→ 点「仍要打开」
+     （macOS 15 起 Apple 已取消"右键 → 打开"这个老办法，别再用右键）
+  B. 终端执行： xattr -cr "/Applications/科研数据归档助手.app"
+
+dmg 里已附《首次打开请看这里.txt》，转发给同事时对方照着做即可。
+要彻底免掉这一步，需要在 Apple 开发者账号下做 codesign + notarize（见 README）。
 
 跨平台一致性提示：分类名中的 "/" 会被替换为全角"／"，
 这样 Windows 与 macOS 归档出来的目录名完全一致，便于同一份数据在两平台间流转。

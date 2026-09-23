@@ -69,12 +69,19 @@ jobs:
           echo "== 可执行文件架构："
           file "dist-mac/科研数据归档助手.app/Contents/MacOS/科研数据归档助手"
 
-      - name: 打包 .app 为 zip
+      - name: 打包 .app 为 zip（附带首次打开说明）
         run: |
           cd dist-mac
-          ditto -c -k --sequesterRsrc --keepParent \
-                "科研数据归档助手.app" \
-                "科研数据归档助手-${{ matrix.label }}.zip"
+          STAGE="科研数据归档助手-${{ matrix.label }}"
+          rm -rf "$STAGE" "$STAGE.zip"
+          mkdir -p "$STAGE"
+          cp -R "科研数据归档助手.app" "$STAGE/"
+          # 说明文件由 build_mac.sh 生成，跟 App 一起放进 zip，方便直接转发
+          if [ -f "首次打开请看这里.txt" ]; then
+            cp "首次打开请看这里.txt" "$STAGE/"
+          fi
+          ditto -c -k --sequesterRsrc --keepParent "$STAGE" "$STAGE.zip"
+          ls -lh "$STAGE.zip"
 
       - uses: actions/upload-artifact@v4
         with:
