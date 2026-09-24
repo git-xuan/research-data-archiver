@@ -238,7 +238,7 @@ def batch_id(ts: Optional[str] = None) -> str:
     return "AR" + (ts or time.strftime("%Y%m%d%H%M%S"))
 
 
-def build_rows(root: str, results: List[dict], l1: str, l2: str,
+def build_rows(root: str, results: List[dict], l1: str, l2: str, l3: str = "",
                meta: Optional[Dict[str, str]] = None,
                granularity: str = "batch",
                index_dir: str = "_归档索引") -> List[Dict[str, str]]:
@@ -285,6 +285,8 @@ def build_rows(root: str, results: List[dict], l1: str, l2: str,
             if k not in keep_ids:
                 row[k] = ""
         row["二级分类"] = l2
+        # 官方表里「三级分类（选填）」只有部分 sheet 有，写了也不会污染没有该列的表
+        row["三级分类（选填）"] = l3
         row["数量统计值"] = str(count)
         row["数量统计单位"] = unit_for(l1, l2)
         row["存储位置详情（选填）"] = pos + ((" / " + extra_pos) if extra_pos else "")

@@ -470,17 +470,18 @@ def same_file_in_dest(dest_dir: str, filename: str, size: int) -> Optional[str]:
     return None
 
 
-def archive_files(root: str, files: List[str], l1: str, l2: str,
+def archive_files(root: str, files: List[str], l1: str, l2: str, l3: str = "",
                   on_progress: Optional[Callable[[int, int, str], None]] = None,
                   keep_mtime: bool = True,
                   known_archived: Optional[Dict[str, dict]] = None) -> List[dict]:
     """
-    把 files 复制到 root/一级/二级 下。
+    把 files 复制到 root/一级/二级（若给了 l3，则为 root/一级/二级/三级）下。
 
     已经归档过的来源文件**不再重复复制**（result='跳过'）；
     只有从未归档、且目标目录不存在同名同大小文件时才真正复制。
     """
-    dest_dir = os.path.join(root, safe_name(l1), safe_name(l2))
+    dirs = [safe_name(l1), safe_name(l2)] + ([safe_name(l3)] if l3 else [])
+    dest_dir = os.path.join(root, *dirs)
     os.makedirs(dest_dir, exist_ok=True)
     known = archived_map(root) if known_archived is None else known_archived
 
@@ -533,7 +534,8 @@ def archive_files(root: str, files: List[str], l1: str, l2: str,
     return results
 
 
-def record_archive(root: str, results: List[dict], l1: str, l2: str) -> dict:
+def record_archive(root: str, results: List[dict], l1: str, l2: str,
+                   l3: str = "") -> dict:
     """把归档结果写入 manifest 与日志（跳过项也会登记，避免下次重复判断）。"""
     mf = read_manifest(root)
     if mf is None:
@@ -545,7 +547,7 @@ def record_archive(root: str, results: List[dict], l1: str, l2: str) -> dict:
         key = src_key(r["src"])
         if r["result"] in ("成功", "跳过") and r["dest"]:
             archived.setdefault(key, {
-                "name": r["name"], "l1": l1, "l2": l2,
+                "name": r["name"], "l1": l1, "l2": l2, "l3": l3,
                 "dest": r["dest"], "time": now,
             })
         try:
@@ -601,8 +603,47 @@ def in_scope(root: str, folder: str) -> bool:
         return False
 
 
+def class_dirs(root: str, *rel: str) -> List[str]:
+    """
+    列出归档目录里**实际存在**的分类子目录名（不是完整分类树）。
+
+    用于归档页的三级下拉：只列出真正建出来的分类，避免把文件归档进不存在的目录。
+    排序按官方分类树顺序，树里没有的（例如手工新建）排在后面按名称排。
+    """
+    base = os.path.join(os.path.abspath(root), *rel) if rel else os.path.abspath(root)
+    if not os.path.isdir(base):
+        return []
+    try:
+        names = [d for d in os.listdir(base)
+                 if os.path.isdir(os.path.join(base, d))
+                 and d != INDEX_DIR and d not in JUNK_DIRS]
+    except OSError:
+        return []
+    # 官方顺序优先
+    ref = TREE
+    if len(rel) >= 1:
+        ref = TREE.get(rel[0], {})
+    if len(rel) >= 2:
+        ref = TREE.get(rel[0], {}).get(rel[1], {})
+    order = {safe_name(k): i for i, k in enumerate(ref.keys())}
+
+    def key(n):
+        return (order.get(n, len(order)), n)
+    names.sort(key=key)
+    return names
+
+
+def has_l3(root: str) -> bool:
+    """归档目录里是否存在三级分类目录。"""
+    for l1 in class_dirs(root):
+        for l2 in class_dirs(root, l1):
+            if class_dirs(root, l1, l2):
+                return True
+    return False
+
+
 def list_scope_folders(root: str, depth: int = 2) -> List[Tuple[str, str, int]]:
-    """列出可作为自查范围的一 / 二级子文件夹：[(显示名, 绝对路径, 层级)]。"""
+    """列出可作为自查范围的一 / 二 / 三级子文件夹：[(显示名, 绝对路径, 层级)]。"""
     root = os.path.abspath(root)
     out: List[Tuple[str, str, int]] = []
     if not os.path.isdir(root):
@@ -624,7 +665,18 @@ def list_scope_folders(root: str, depth: int = 2) -> List[Tuple[str, str, int]]:
         except OSError:
             continue
         for b in second:
-            out.append(("│    └ " + b, os.path.join(pa, b), 2))
+            pb = os.path.join(pa, b)
+            out.append(("│    ├ " + b, pb, 2))
+            if depth < 3:
+                continue
+            try:
+                third = sorted(d for d in os.listdir(pb)
+                               if os.path.isdir(os.path.join(pb, d))
+                               and d != INDEX_DIR and d not in JUNK_DIRS)
+            except OSError:
+                continue
+            for c in third:
+                out.append(("│    │    └ " + c, os.path.join(pb, c), 3))
     return out
 
 
@@ -666,6 +718,7 @@ def scan_archive(root: str, scope: Optional[str] = None,
             parts = rel.split(os.sep)
             l1 = parts[0] if len(parts) > 1 else ROOT_LABEL
             l2 = parts[1] if len(parts) > 2 else ""
+            l3 = parts[2] if len(parts) > 3 else ""
             sub = os.path.relpath(os.path.dirname(fp), base)
             if whole:
                 group = f"{l1} / {l2}" if l2 else l1
@@ -673,39 +726,54 @@ def scan_archive(root: str, scope: Optional[str] = None,
                 group = "（本级文件）"
             else:
                 group = sub
+            # 三级分组：只有真的放在三级目录下的文件才带三级名，否则与二级分组一致
+            group3 = f"{group} / {l3}" if l3 else group
             records.append({
                 "path": fp,
                 "rel": rel,
                 "name": fn,
                 "l1": l1,
                 "l2": l2,
+                "l3": l3,
                 "group": group,
+                "group3": group3,
                 "size": st.st_size,
                 "mtime": _dt.datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M"),
             })
-    records.sort(key=lambda r: (r["group"], r["name"].lower()))
+    records.sort(key=lambda r: ((r.get("group3") or r["group"]), r["name"].lower()))
     if stats is not None:
         stats["junk_skipped"] = skipped
+        stats["has_l3"] = any(r.get("l3") for r in records)
     return records
 
 
 def sample_archive(records: List[dict], mode: str = "all",
                    ratio: float = 0.10, min_n: int = 1, max_n: int = 20,
-                   rng: Optional[random.Random] = None) -> List[dict]:
-    """mode: 'all' 全部文件；'ratio' 按二级分类（或所选范围内的子文件夹）随机抽样。"""
+                   rng: Optional[random.Random] = None,
+                   by: str = "l2") -> List[dict]:
+    """
+    mode: 'all' 全部文件；'ratio' 按分类随机抽样。
+
+    by='l2' 按二级分类分组；by='l3' 按三级分类分组（未落到三级的文件归入其二级分组）。
+    """
     if mode == "all":
         return list(records)
     rng = rng or random.Random()
+    keyname = "group3" if by == "l3" else "group"
+
+    def gkey(r):
+        return r.get(keyname) or r.get("group") or ""
+
     groups: "OrderedDict[str, List[dict]]" = OrderedDict()
     for r in records:
-        groups.setdefault(r.get("group", ""), []).append(r)
+        groups.setdefault(gkey(r), []).append(r)
     picked: List[dict] = []
     for _key, items in groups.items():
         n = int(round(len(items) * ratio))
         n = max(min_n, min(max_n, n)) if items else 0
         n = min(n, len(items))
         picked.extend(rng.sample(items, n))
-    picked.sort(key=lambda r: (r.get("group", ""), r["name"].lower()))
+    picked.sort(key=lambda r: (gkey(r), r["name"].lower()))
     return picked
 
 

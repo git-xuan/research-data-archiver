@@ -399,7 +399,7 @@ class InitPage(QWidget):
 
         # —— 选择目标路径
         c1 = Card("选择归档目标路径", "指定一个空的文件夹（或尚不存在的路径）作为科研数据归档根目录。"
-                                    "系统会在此路径下按分类树建立一级、二级分类文件夹。", "1")
+                                    "下方可勾选只创建其中的一部分分类。", "1")
         row = QHBoxLayout()
         row.setSpacing(8)
         self.ed_path = QLineEdit()
@@ -431,7 +431,8 @@ class InitPage(QWidget):
                   f"只有勾选的目录会被创建 —— 不需要的分类取消勾选即可；"
                   f"勾选子目录时，其上级目录会自动一起建出来。", "2")
         bar = QHBoxLayout()
-        self.chk_l3 = QCheckBox("同时列出三级分类子目录（可选）")
+        self.chk_l3 = QCheckBox("同时列出三级分类子目录（默认不建，勾选后需逐个挑选）")
+        self.chk_l3.setChecked(False)          # 默认不展开三级，避免误建一大堆目录
         self.chk_l3.toggled.connect(self._on_l3_toggled)
         b_all = QPushButton("全选")
         b_all.setObjectName("ghost")
@@ -529,17 +530,14 @@ class InitPage(QWidget):
         try:
             self.tree.clear()
             show_l3 = self.chk_l3.isChecked()
-            # 该二级下是否已经有"三级勾选信息"（用于决定新列出的三级默认是否勾上）
-            has_l3_info = {k[:2] for k in (sel or ()) if len(k) == 3}
 
-            def checked(key, parent_key=None, inherit=False):
-                """inherit=True 只用于三级项：刚展开三级时继承所属二级的勾选状态。"""
+            def checked(key):
+                # sel=None 表示首次构建 → 默认全选（只影响当时列出的层级）
+                # 三级项只在用户展开过之后再出现，那时 sel 一定不是 None，
+                # 所以三级默认**不勾选**，必须由用户逐个挑。
                 if sel is None:
                     return True
-                if key in sel:
-                    return True
-                return bool(inherit and parent_key and parent_key in sel
-                            and parent_key not in has_l3_info)
+                return key in sel
 
             for a, d2 in core.TREE.items():
                 it1 = QTreeWidgetItem([core.safe_name(a), "一级目录",
@@ -572,8 +570,7 @@ class InitPage(QWidget):
                             it3.setForeground(1, QColor(TEXT_MUTED))
                             it3.setFlags(it3.flags() | Qt.ItemIsUserCheckable)
                             it3.setCheckState(
-                                0, Qt.Checked
-                                if checked((a, l2, l3name), (a, l2), inherit=True)
+                                0, Qt.Checked if checked((a, l2, l3name))
                                 else Qt.Unchecked)
                             it2.addChild(it3)
                     it1.addChild(it2)
@@ -832,6 +829,7 @@ class ArchivePage(QWidget):
         self._pending = []         # 本次实际执行的待归档列表
         self.archived = {}         # normcase(src) -> info
         self._row_of = {}
+        self._has_l3 = False       # 当前二级分类下是否有三级目录
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -928,15 +926,23 @@ class ArchivePage(QWidget):
 
         # 3 归档目标（分类选择 + 执行合并为一张卡，把更多高度留给文件列表）
         c3 = Card("选择归档到的分类目录并执行",
-                  "先选择一级分类、再选择二级分类；『智能推荐』依据文件名给出建议，仅供参考。", "3")
+                  "一级、二级分类来自归档目录里实际创建的分类；"
+                  "若该二级分类下建了三级目录，则必须再选一个三级分类，文件会归档到三级目录里。"
+                  "『智能推荐』依据文件名给出建议，仅供参考。", "3")
         r3 = QHBoxLayout()
         r3.setSpacing(9)
         self.cb_l1 = QComboBox()
-        self.cb_l1.setMinimumWidth(210)
+        self.cb_l1.setMinimumWidth(190)
         self.cb_l1.currentTextChanged.connect(self._on_l1)
         self.cb_l2 = QComboBox()
-        self.cb_l2.setMinimumWidth(210)
-        self.cb_l2.currentTextChanged.connect(lambda _: self._update_target())
+        self.cb_l2.setMinimumWidth(190)
+        self.cb_l2.currentTextChanged.connect(self._on_l2)
+        self.lb_l3 = QLabel("三级分类")
+        self.lb_l3.setVisible(False)
+        self.cb_l3 = QComboBox()
+        self.cb_l3.setMinimumWidth(190)
+        self.cb_l3.setVisible(False)
+        self.cb_l3.currentTextChanged.connect(lambda _: self._update_target())
         b_rec = QPushButton("  智能推荐")
         b_rec.setIcon(skin.icon("wand", 16, skin.TEXT_SUB))
         b_rec.clicked.connect(self.recommend)
@@ -947,6 +953,8 @@ class ArchivePage(QWidget):
         r3.addWidget(self.cb_l1)
         r3.addWidget(QLabel("二级分类"))
         r3.addWidget(self.cb_l2)
+        r3.addWidget(self.lb_l3)
+        r3.addWidget(self.cb_l3)
         r3.addWidget(b_rec)
         r3.addStretch(1)
         c3.body.addLayout(r3)
@@ -979,7 +987,7 @@ class ArchivePage(QWidget):
         self.log.setFixedHeight(70)
         self.log.setVisible(False)
         c3.body.addWidget(self.log)
-        self.cb_l1.addItems(core.l1_list())
+        self.reload_categories()
         root.addWidget(c3)
 
     # ------------------------------------------------------------------ 数据
@@ -997,7 +1005,30 @@ class ArchivePage(QWidget):
             self.lb_root_state.setText("● 未初始化（请先完成初始化）")
             self.lb_root_state.setObjectName("danger")
         ArchivePage._style(self.lb_root_state)
+        self.reload_categories()
         self._refresh_status()
+
+    def reload_categories(self):
+        """
+        按归档目录里**实际创建**的分类重建三级下拉框。
+
+        只列真实存在的目录，避免把文件归档进没建过的分类；二级下有三级的，
+        三级下拉才会出现，并且必须选一个才能归档。
+        """
+        root = self.ed_root.text().strip()
+        keep = (self.cb_l1.currentText(), self.cb_l2.currentText(),
+                self.cb_l3.currentText())
+        for cb in (self.cb_l1, self.cb_l2, self.cb_l3):
+            cb.blockSignals(True)
+            cb.clear()
+            cb.blockSignals(False)
+        if root and core.is_initialized(root):
+            self.cb_l1.addItems(core.class_dirs(root))
+        else:
+            self.cb_l1.addItems(core.l1_list())      # 还没初始化时先给完整分类树做参考
+        if keep[0]:
+            self.cb_l1.setCurrentText(keep[0])
+        self._on_l1(self.cb_l1.currentText(), keep_l2=keep[1], keep_l3=keep[2])
 
     @staticmethod
     def _style(w):
@@ -1235,22 +1266,53 @@ class ArchivePage(QWidget):
         self._update_sel_label()
 
     # ------------------------------------------------------------------ 分类
-    def _on_l1(self, text):
+    def _categories_for(self, *rel):
+        """该层级可选的分类：归档已初始化时取实际存在的目录，否则退回完整分类树。"""
+        root = self.ed_root.text().strip()
+        if root and core.is_initialized(root):
+            return core.class_dirs(root, *rel)
+        if not rel:
+            return core.l1_list()
+        if len(rel) == 1:
+            return core.l2_list(rel[0])
+        return core.l3_list(rel[0], rel[1])
+
+    def _on_l1(self, text, keep_l2=None, keep_l3=None):
         self.cb_l2.blockSignals(True)
         self.cb_l2.clear()
-        self.cb_l2.addItems(core.l2_list(text))
+        self.cb_l2.addItems(self._categories_for(text))
+        if keep_l2:
+            self.cb_l2.setCurrentText(keep_l2)
         self.cb_l2.blockSignals(False)
+        self._on_l2(self.cb_l2.currentText(), keep_l3=keep_l3)
+
+    def _on_l2(self, text, keep_l3=None):
+        l1 = self.cb_l1.currentText()
+        names = self._categories_for(l1, text) if text else []
+        self.cb_l3.blockSignals(True)
+        self.cb_l3.clear()
+        self.cb_l3.addItems(names)
+        if keep_l3:
+            self.cb_l3.setCurrentText(keep_l3)
+        self.cb_l3.blockSignals(False)
+        # 该二级分类下真的建了三级目录 → 显示三级下拉，并且必须选一个
+        self._has_l3 = bool(names)
+        self.lb_l3.setVisible(self._has_l3)
+        self.cb_l3.setVisible(self._has_l3)
         self._update_target()
 
     def _update_target(self):
         l1, l2 = self.cb_l1.currentText(), self.cb_l2.currentText()
+        l3 = self.cb_l3.currentText() if getattr(self, "_has_l3", False) else ""
         if not (l1 and l2):
             self.lb_target.setText("")
             return
-        target = os.path.join(self.ed_root.text() or "<归档根目录>",
-                              core.safe_name(l1), core.safe_name(l2))
-        self.lb_target.setText("归档到：" + target)
-
+        parts = [core.safe_name(l1), core.safe_name(l2)]
+        if l3:
+            parts.append(core.safe_name(l3))
+        target = os.path.join(self.ed_root.text() or "<归档根目录>", *parts)
+        hint = "（该二级分类下已有三级目录，必须一并选择）" if (self._has_l3 and not l3) else ""
+        self.lb_target.setText("归档到：" + target + hint)
     def recommend(self):
         pool = self.checked_files() or self.files
         if not pool:
@@ -1295,8 +1357,15 @@ class ArchivePage(QWidget):
                 "提示：可点选、按住 Ctrl / Shift 多选，选中后按空格键批量勾选或取消。")
             return
         l1, l2 = self.cb_l1.currentText(), self.cb_l2.currentText()
+        l3 = self.cb_l3.currentText() if getattr(self, "_has_l3", False) else ""
         if not (l1 and l2):
             QMessageBox.warning(self, "缺少分类", "请选择一级分类与二级分类。"); return
+        if self._has_l3 and not l3:
+            QMessageBox.warning(
+                self, "缺少三级分类",
+                f"归档目录里「{l1} / {l2}」下面已经建了三级分类目录，\n"
+                f"因此文件必须归档到三级目录里。\n\n请再选择一个三级分类。")
+            return
 
         # 只对「未归档」的文件执行复制，已归档的一律跳过
         # （重新读一次索引，避免其他窗口/进程刚归档过造成误判）
@@ -1310,7 +1379,8 @@ class ArchivePage(QWidget):
             self._refresh_status()
             return
 
-        dest = os.path.join(root, core.safe_name(l1), core.safe_name(l2))
+        dest = os.path.join(root, core.safe_name(l1), core.safe_name(l2),
+                            *([core.safe_name(l3)] if l3 else []))
         total_size = 0
         for p in pending:
             try:
@@ -1355,11 +1425,11 @@ class ArchivePage(QWidget):
         todo = list(pending)
 
         def job(cb):
-            return core.archive_files(root, todo, l1, l2, cb)
+            return core.archive_files(root, todo, l1, l2, l3, cb)
 
         self.worker = FnWorker(job)
         self.worker.progress.connect(self._on_prog)
-        self.worker.done.connect(lambda res: self._done(root, res, l1, l2))
+        self.worker.done.connect(lambda res: self._done(root, res, l1, l2, l3))
         self.worker.failed.connect(self._fail)
         self.worker.start()
 
@@ -1368,11 +1438,11 @@ class ArchivePage(QWidget):
         self.lb_res.setText(f"复制中 {i}/{t} · {name}")
         self.log.append(f"[{i}/{t}] {name}")
 
-    def _done(self, root, results, l1, l2):
+    def _done(self, root, results, l1, l2, l3=""):
         self.prog.setVisible(False)
         self.btn_go.setEnabled(True)
         try:
-            core.record_archive(root, results, l1, l2)
+            core.record_archive(root, results, l1, l2, l3)
             self.archived = core.archived_map(root)
         except Exception as e:                                        # noqa: BLE001
             QMessageBox.warning(self, "索引写入失败", str(e))
@@ -1389,8 +1459,9 @@ class ArchivePage(QWidget):
             if getattr(self, "_ledger_ok", False):
                 try:
                     rows = ledger.build_rows(
-                        root, results, l1, l2, getattr(self, "_ledger_meta", {}),
-                        core.manifest_get(root, "ledger_granularity", "batch"))
+                        root, results, l1, l2, l3,
+                        meta=getattr(self, "_ledger_meta", {}),
+                        granularity=core.manifest_get(root, "ledger_granularity", "batch"))
                     n_ledger = ledger.append_rows(root, rows)
                 except Exception as e:                                # noqa: BLE001
                     ledger_err = f"{type(e).__name__}: {e}"
@@ -1516,6 +1587,7 @@ class CheckPage(QWidget):
         self.scope = ""            # 当前检查范围绝对路径（空 = 整个归档根目录）
         self._scan_key = None      # 已扫描的 (根目录, 范围)，参数变化时不用重扫
         self._junk = 0             # 上次扫描被忽略的系统文件数
+        self._no_l3 = True         # 归档目录里有没有三级分类（决定是否提供按三级抽样）
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -1566,7 +1638,7 @@ class CheckPage(QWidget):
         r3 = QHBoxLayout()
         r3.setSpacing(14)
         self.rb_all = QRadioButton("检查范围内全部文件")
-        self.rb_ratio = QRadioButton("按二级分类随机抽样")
+        self.rb_ratio = QRadioButton("按分类随机抽样")
         self.rb_ratio.setChecked(True)
         b_scan = QPushButton("  开始检查")
         b_scan.setObjectName("primary")
@@ -1583,6 +1655,19 @@ class CheckPage(QWidget):
         r3b = QHBoxLayout()
         r3b.setSpacing(7)
         r3b.addSpacing(24)
+        self.lb_by = QLabel("抽样分组")
+        self.lb_by.setObjectName("muted")
+        self.cb_by = QComboBox()
+        self.cb_by.addItem("按二级分类", "l2")
+        self.cb_by.addItem("按三级分类", "l3")
+        self.cb_by.setFixedWidth(126)
+        self.cb_by.setToolTip("按哪一级分类分组抽样：每个分组各自独立按比例抽取。\n"
+                              "只有在归档目录里真的建了三级分类目录时才有「按三级分类」这一项。")
+        self.cb_by.currentIndexChanged.connect(self._on_rule_changed)
+        self.lb_by.setVisible(False)
+        self.cb_by.setVisible(False)
+        r3b.addWidget(self.lb_by)
+        r3b.addWidget(self.cb_by)
         self.sp_ratio = QDoubleSpinBox()
         self.sp_ratio.setRange(0.5, 100.0)
         self.sp_ratio.setDecimals(1)
@@ -1710,8 +1795,9 @@ class CheckPage(QWidget):
         self.shown = []
         self._scan_key = None
         self._junk = 0
-        self._load_rule()
+        # 先按实际结构重建范围下拉（同时决定要不要显示「按三级分类」），再恢复抽样规则
         self.reload_scopes()
+        self._load_rule()
         self.do_sample(silent=True)
 
     def pick_root(self):
@@ -1735,14 +1821,20 @@ class CheckPage(QWidget):
             self.cb_scope.blockSignals(False)
             self.scope = ""
             self.lb_scope.setText("")
+            self._sync_by_selector()
             return
         self.cb_scope.setEnabled(True)
-        self.cb_scope.addItem("整个归档目录（全部一级 / 二级分类）", os.path.normpath(root))
-        for text, path, _lv in core.list_scope_folders(root):
+        depth = 3 if core.has_l3(root) else 2
+        self.cb_scope.addItem(
+            "整个归档目录（全部一 / 二 / 三级分类）" if depth == 3
+            else "整个归档目录（全部一级 / 二级分类）",
+            os.path.normpath(root))
+        for text, path, _lv in core.list_scope_folders(root, depth):
             self.cb_scope.addItem(text, os.path.normpath(path))
         idx = self.cb_scope.findData(keep) if keep else 0
         self.cb_scope.setCurrentIndex(idx if idx >= 0 else 0)
         self.cb_scope.blockSignals(False)
+        self._sync_by_selector()
         self._on_scope_changed()
 
     def _on_scope_changed(self):
@@ -1794,7 +1886,7 @@ class CheckPage(QWidget):
         self.do_sample(silent=True, force=False)
 
     # ------------------------------------------------------------------ 抽样规则
-    DEFAULT_RULE = {"ratio": 10.0, "min": 1, "max": 20, "mode": "ratio"}
+    DEFAULT_RULE = {"ratio": 10.0, "min": 1, "max": 20, "mode": "ratio", "by": "l2"}
 
     def _on_rule_changed(self, *_):
         ratio_mode = self.rb_ratio.isChecked()
@@ -1815,7 +1907,8 @@ class CheckPage(QWidget):
             self.lb_rule.setText("列出范围内全部文件，不做抽样")
             return
         n = len(self.shown) if getattr(self, "records", None) else 0
-        txt = (f"每个分类抽 {self.sp_ratio.value():g}%，至少 {self.sp_min.value()} 个、"
+        lv = "三级分类" if self.sample_by() == "l3" else "二级分类"
+        txt = (f"每个{lv}抽 {self.sp_ratio.value():g}%，至少 {self.sp_min.value()} 个、"
                f"至多 {self.sp_max.value()} 个")
         if self.records:
             txt += f" → 本次 {n}/{len(self.records)} 个"
@@ -1829,6 +1922,7 @@ class CheckPage(QWidget):
                 "min": self.sp_min.value(),
                 "max": self.sp_max.value(),
                 "mode": "all" if self.rb_all.isChecked() else "ratio",
+                "by": self.sample_by(),
             })
 
     def _load_rule(self):
@@ -1851,6 +1945,13 @@ class CheckPage(QWidget):
         self.rb_ratio.setChecked(rule.get("mode") != "all")
         self.rb_all.blockSignals(False)
         self.rb_ratio.blockSignals(False)
+        # 抽样分组层级（没有三级目录时 _sync_by_selector 会把这一项藏起来）
+        want = rule.get("by") or "l2"
+        idx = self.cb_by.findData(want)
+        if idx >= 0 and self.cb_by.isVisible():
+            self.cb_by.blockSignals(True)
+            self.cb_by.setCurrentIndex(idx)
+            self.cb_by.blockSignals(False)
         self._on_rule_changed()
 
     def reset_rule(self):
@@ -1861,6 +1962,24 @@ class CheckPage(QWidget):
     def sample_params(self):
         """当前抽样参数：(比例, 每类最少, 每类最多)。"""
         return (self.sp_ratio.value() / 100.0, self.sp_min.value(), self.sp_max.value())
+
+    def sample_by(self):
+        """抽样分组层级：'l2' 按二级分类，'l3' 按三级分类（归档无三级时恒为 l2）。"""
+        if getattr(self, "_no_l3", True):
+            return "l2"
+        return self.cb_by.currentData() or "l2"
+
+    def _sync_by_selector(self):
+        """归档目录里有没有三级目录 → 决定是否提供「按三级分类」这一项。"""
+        root = self.ed_root.text().strip()
+        has = bool(root) and core.is_initialized(root) and core.has_l3(root)
+        self._no_l3 = not has
+        self.lb_by.setVisible(has)
+        self.cb_by.setVisible(has)
+        if not has:
+            self.cb_by.blockSignals(True)
+            self.cb_by.setCurrentIndex(0)
+            self.cb_by.blockSignals(False)
 
     # ------------------------------------------------------------------ 抽样
     def do_sample(self, silent=False, force=True):
@@ -1878,11 +1997,13 @@ class CheckPage(QWidget):
             self._scan_key = key
         mode = "all" if self.rb_all.isChecked() else "ratio"
         ratio, mn, mx = self.sample_params()
+        by = self.sample_by()
         self.shown = core.sample_archive(self.records, mode, ratio, mn, mx,
-                                         random.Random())
+                                         random.Random(), by=by)
         self.fill_table()
-        self._set_chips(len(self.records),
-                        len({r["group"] for r in self.records}), len(self.shown),
+        gkey = "group3" if by == "l3" else "group"
+        ngroup = len({(r.get(gkey) or r.get("group")) for r in self.records})
+        self._set_chips(len(self.records), ngroup, len(self.shown),
                         getattr(self, "_junk", 0))
         self._update_rule_label()
         if not self.records and not silent:
@@ -2310,7 +2431,8 @@ HELP_TEXT = """
   分类树总共 5 个一级、30 个二级（另有三、四级共 76 / 251 个可作细分参考）；
 · 勾选某个子目录时，它的上级目录会<b>自动一起建出来</b>（父目录必须存在）；
   『全选 / 全不选』可一键切换，底部会实时显示"将创建 一级 x 个 · 二级 y 个 · 合计 n 个目录"；
-· 勾『同时列出三级分类子目录』可以把三级也纳入选择；
+· <b>三级分类默认不勾选</b>：勾『同时列出三级分类子目录』只是把它们显示出来，
+  需要哪个就自己勾哪个，不会因为展开一下就建出一大堆目录；
 · 选多了或后来需要补：再勾上缺失的，点『补齐勾选的分类目录』即可，<b>已建目录与已有数据不受影响</b>；
 · 初始化会生成《归档说明.md》（只列实际创建的目录）与归档索引。一个归档根目录只需初始化一次。</p>
 
@@ -2319,6 +2441,10 @@ HELP_TEXT = """
 再在列表最左侧的『归档』列<b>勾选</b>真正要归档的文件——可点选、按住 Ctrl / Shift 多选，
 选中行后按<b>空格键</b>批量勾选或取消，也可用上方的『全选 / 全不选 / 反选 / 勾选高亮行』。
 最后选择一级、二级分类，点击『开始归档』。<br>
+· 分类下拉里列出的，是<b>归档目录里实际创建过的分类</b>（不是完整分类树），
+  这样不会把文件归档进没建过的目录；<br>
+· <b>如果该二级分类下建了三级目录，会多出一个「三级分类」下拉，必须一并选择</b>，
+  文件会归档到 一级/二级/三级 目录里；该二级下没建三级时，三级下拉会收起，直接归档到二级；<br>
 · 归档是 <b>复制</b> 操作，<b>不会删除原始文件</b>；<br>
 · <b>已归档的文件不会重复复制</b>：列表中会显示 <b>[已归档]</b> 标记且无法再勾选；<br>
 · 只有从未归档的文件才真正复制；若目标目录已有同名同大小文件，也按已归档直接跳过，
@@ -2326,13 +2452,16 @@ HELP_TEXT = """
 · 每次归档都会写入 <code>_归档索引/归档日志.csv</code>，便于追溯。</p>
 
 <p><b>③ 归档自查</b><br>
-先选归档根目录，再用『检查范围』下拉框把范围收窄到某个<b>一级或二级分类子文件夹</b>
-（也可以点『其他子文件夹…』选到更深的目录，如三级目录）。<br>
+先选归档根目录，再用『检查范围』下拉框把范围收窄到某个<b>一级 / 二级 / 三级分类子文件夹</b>
+（也可以点『其他子文件夹…』手选更深的目录）。<br>
 然后在所选范围内点击『开始检查』，规则可选『检查范围内全部文件』或
-<b>『按二级分类随机抽样』——比例由你自己填</b>（默认 10%，可填 0.5%～100%，每个分类独立计算）；
-还能设定每个分类的<b>保底数量</b>（默认至少 1 个）和<b>封顶数量</b>（默认至多 20 个），
-避免大分类拖垮复核工作量。参数一改就立刻按新规则重算，不用再点一次『开始检查』；
-点『恢复默认』回到 10% / 至少 1 个 / 至多 20 个。抽样规则按归档根目录记忆，下次打开自动沿用。
+<b>『按分类随机抽样』——比例由你自己填</b>（默认 10%，可填 0.5%～100%，每个分类独立计算）；<br>
+· <b>抽样分组可选「按二级分类」或「按三级分类」</b>：归档目录里真的建了三级目录时，
+  会出现『抽样分组』下拉，选『按三级分类』就按每个三级分类各自独立抽取
+  （没落到三级目录的文件，仍归到它所在的二级分类里一起抽）；<br>
+· 还能设定每个分类的<b>保底数量</b>（默认至少 1 个）和<b>封顶数量</b>（默认至多 20 个），
+  避免大分类拖垮复核工作量。参数一改就立刻按新规则重算，不用再点一次『开始检查』；<br>
+点『恢复默认』回到 10% / 至少 1 个 / 至多 20 个。抽样规则（含分组层级）按归档根目录记忆，下次打开自动沿用。<br>
 在表格中勾选归档有问题的文件，点击底部『导出问题文件清单』即可得到 CSV 清单。</p>
 
 <p><b>④ 数据台账</b><br>
@@ -2588,7 +2717,7 @@ class MainWindow(QMainWindow):
 
     # -------------------------------------------------------------- 导航
     TITLES = [
-        ("初始化归档目录", "按分类树创建一级 / 二级分类文件夹，一个归档根目录只需初始化一次"),
+        ("初始化归档目录", "按需勾选要创建的一 / 二 / 三级分类文件夹，一个归档根目录只需初始化一次"),
         ("文件归档", "选择待归档科研数据 → 选择分类目录 → 复制归档（保留原始文件）"),
         ("归档自查", "随机抽样复核归档结果，勾选问题文件并一键导出清单"),
         ("数据台账", "归档时自动生成《科研数据元信息采集》对应的一行，可导出官方表结构的 Excel"),
@@ -2662,7 +2791,7 @@ def _selftest(out_path: str) -> int:
                                  "实验与过程数据", "材料合成与加工记录")
         core.record_archive(root, res, "实验与过程数据", "材料合成与加工记录")
         rows = ledger.build_rows(root, res, "实验与过程数据", "材料合成与加工记录",
-                                 ledger.default_meta())
+                                 meta=ledger.default_meta())
         n = ledger.append_rows(root, rows)
         lines.append("ledger append rows=%d" % n)
         p = ledger.export_xlsx(root)
